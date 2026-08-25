@@ -6,14 +6,17 @@ distance (EMD). It trains MA-PFN and the original unconstrained PFN with the
 same data split and optimizer settings, then compares their held-out accuracy
 and metric properties.
 
-The example deliberately contains one implementation file. The notebook is a
-generated view of that file, so the command-line and interactive versions do
-not maintain separate model definitions.
+The notebook is deliberately short: it contains only the experiment narrative,
+configuration, workflow call, and result summary. The model definitions and
+reusable experiment machinery live in ordinary Python modules, so the
+command-line and interactive versions still share one implementation.
 
 ## Contents
 
-- `ma_pfn_demo.py`: models, training loop, evaluation, plots, and CLI.
-- `ma_pfn_demo.ipynb`: generated notebook with a short default run.
+- `ma_pfn_demo.py`: concise notebook source and command-line entry point.
+- `ma_pfn_demo.ipynb`: generated minimal notebook with a short default run.
+- `models.py`: side-by-side MA-PFN and stock-PFN model definitions.
+- `utils.py`: data loading, training, evaluation, plotting, and CLI helpers.
 - `make_notebook.py`: local Jupytext wrapper used by CI.
 - `jupytext.toml`: declares the paired `ipynb,py:percent` formats.
 - `.github/workflows/sync-notebook.yml`: regenerates and commits the notebook
@@ -155,9 +158,10 @@ tolerance for pass/fail decisions is `1e-3` GeV.
 
 ## Notebook
 
-Open `ma_pfn_demo.ipynb`, edit `notebook_config` in the last cell, and run all
-cells. Its committed defaults are intentionally small. `ma_pfn_demo.py` is the
-source of truth. To regenerate the notebook locally after editing it:
+Open `ma_pfn_demo.ipynb`, edit `config`, and run all cells. Its committed
+defaults are intentionally small. `ma_pfn_demo.py` is the source of truth for
+the generated notebook; `models.py` and `utils.py` hold the imported
+implementation. To regenerate the notebook locally after editing its source:
 
 ```bash
 python -m pip install jupytext==1.19.5
@@ -165,24 +169,33 @@ python make_notebook.py
 ```
 
 The GitHub Actions workflow runs the same command whenever `ma_pfn_demo.py`,
-the wrapper, or the Jupytext configuration is pushed. If the generated
-notebook changed, the workflow commits it back to the pushed branch as
-`github-actions[bot]`. The workflow requests only `contents: write`; the
-repository must allow GitHub Actions to write to the target branch. Protected
-branches that require pull requests will reject this automatic commit.
+`models.py`, `utils.py`, the wrapper, or the Jupytext configuration is pushed.
+If the generated notebook changed, the workflow commits it back to the pushed
+branch as `github-actions[bot]`. The workflow requests only `contents: write`;
+the repository must allow GitHub Actions to write to the target branch.
+Protected branches that require pull requests will reject this automatic
+commit.
 
 The `.github/workflows` path assumes that the contents of this directory become
 the root of the standalone release repository. GitHub will not discover this
 workflow while `ma-pfn-minimal/` remains nested inside a different repository.
 
-Do not edit generated notebook code directly. Make the change in
-`ma_pfn_demo.py`; Jupytext converts its `# %%` cells to the notebook.
+Do not edit generated notebook code directly. Change the notebook-facing cells
+in `ma_pfn_demo.py`; change models or reusable workflow code in `models.py` or
+`utils.py`.
 
 ## Reproducibility and release checklist
 
-- Record SHA-256 checksums for the six arrays in the Zenodo upload.
-- Fill every `[TODO]` field in `zenodo/DATASET_DESCRIPTION.md`, especially the
-  generator settings, EMD convention, authors, licenses, and paper DOI.
+- Upload the dataset directly from OSCAR with
+  `./zenodo/upload_to_zenodo.sh`. The script defaults to draft record
+  `22099234`, prompts securely for a Zenodo token, verifies file sizes, and
+  leaves publication as a manual step. Run it first with `--dry-run` to inspect
+  the files without contacting Zenodo. Use `--help` to override the draft ID or
+  data directory.
+- Upload `zenodo/checksums.sha256` alongside the six arrays.
+- Fill every remaining `[TODO]` field in `zenodo/DATASET_DESCRIPTION.md`,
+  especially the authors, license, paper DOI, array-derivation details, and
+  split provenance.
 - Add the chosen code license as `LICENSE`. The data license belongs in the
   Zenodo record and may differ from the code license.
 - Run the smoke command in a fresh environment and archive `summary.json` with
