@@ -1,0 +1,6 @@
+data/
+results/
+results_notebook/
+__pycache__/
+.ipynb_checkpoints/
+zenodo/
