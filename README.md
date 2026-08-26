@@ -158,10 +158,12 @@ tolerance for pass/fail decisions is `1e-3` GeV.
 
 ## Notebook
 
-Open `ma_pfn_demo.ipynb`, edit `config`, and run all cells. Its committed
-defaults are intentionally small. `ma_pfn_demo.py` is the source of truth for
-the generated notebook; `models.py` and `utils.py` hold the imported
-implementation. To regenerate the notebook locally after editing its source:
+Open `ma_pfn_demo.ipynb`, edit the single, fully explicit `config` cell, and run
+all cells. Its committed defaults are intentionally small, with release-scale
+values noted next to the settings that differ. `ma_pfn_demo.py` is the source
+of truth for the generated notebook; `models.py` and `utils.py` hold the
+imported implementation. To regenerate the notebook locally after editing its
+source:
 
 ```bash
 python -m pip install jupytext==1.19.5

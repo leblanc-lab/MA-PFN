@@ -20,10 +20,10 @@
 #
 # This notebook trains a metric-aware particle flow network (MA-PFN) and a
 # stock PFN under identical conditions, then compares held-out EMD regression
-# and the four metric properties: non-negativity, identity, symmetry, and the
+# and four metric properties: non-negativity, identity, symmetry, and the
 # triangle inequality.
 #
-# The intentionally short notebook is the experiment recipe. Model definitions
+# The short notebook is the demo. Model definitions
 # live in [`models.py`](models.py), while data loading, training, metrics, and
 # plots live in [`utils.py`](utils.py).
 
@@ -43,29 +43,47 @@ from utils import WorkflowConfig, parse_args, run_workflow
 # MA-PFN instead pools the two events separately and builds its prediction from
 # exchange-invariant latent sums and absolute differences. A bias-free
 # difference branch and an absolute-valued output guarantee non-negativity,
-# exchange symmetry, and zero self-distance. Triangle inequality is measured,
-# not imposed.
+# exchange symmetry, and zero self-distance.
 
 # %% [markdown]
 # ## Configure the demonstration
 #
-# These limits make the notebook quick to inspect and test. Set the pair limits
-# to `None`, increase `epochs`, and raise `metric_samples` for the full release
-# run. The command-line interface exposes the same settings via
-# `python ma_pfn_demo.py --help`.
+# All experimental choices are exposed below so a reader can change them in one
+# place. The committed values define a short demonstration. Comments identify
+# the release-scale values where they differ. Pair limits select reproducible
+# random subsets; use `None` for every available training or validation pair.
+# `stage` can be `"all"`, `"train"`, or `"benchmark"`.
 
 # %%
-if "get_ipython" in globals():
-    config = WorkflowConfig(
-        data_dir=Path("data"),
-        output_dir=Path("results_notebook"),
-        epochs=5,
-        patience=0,
-        max_train_pairs=50_000,
-        max_val_pairs=10_000,
-        max_test_pairs=20_000,
-        metric_samples=2_000,
-    )
+config = WorkflowConfig(
+    # Data and workflow
+    data_dir=Path("data"),
+    output_dir=Path("results_notebook"),
+    stage="all",
+    device="auto",  # automatically use CUDA when available
+    seed=12_345,
+
+    # Architecture (shared wherever possible for a controlled comparison)
+    latent_dim=64,
+    phi_hidden_dim=100,
+    f_hidden_dim=100,
+
+    # Optimization
+    epochs=5,  # release scale: 500
+    patience=0,  # release scale: 50; 0 disables early stopping
+    batch_size=1_024,
+    learning_rate=1e-4,
+    num_workers=0,
+    preload=False,  # True is faster if the selected arrays fit in host RAM
+
+    # Reproducible demo subsets and final benchmarks
+    max_train_pairs=50_000,  # release scale: None
+    max_val_pairs=10_000,  # release scale: None
+    max_test_pairs=20_000,  # release scale: 100_000
+    metric_samples=2_000,  # release scale: 20_000
+    tolerance=1e-3,  # GeV; pass/fail tolerance for metric properties
+    make_plots=True,
+)
 
 
 # %% [markdown]
