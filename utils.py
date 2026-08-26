@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import math
 from pathlib import Path
 import random
+import shutil
 import time
 from typing import Callable
+from urllib.request import urlopen
 
 import numpy as np
 import torch
@@ -21,6 +24,15 @@ from models import MAPELoss, MAPFN, PFN
 
 MODEL_LABELS = {"ma_pfn": "MA-PFN", "pfn": "PFN"}
 MODEL_COLORS = {"ma_pfn": "#0072B2", "pfn": "#D55E00"}
+DATA_SPLITS = ("train", "val", "test")
+TUTORIAL_SUBSET_FILENAME = "ma_pfn_tutorial_subset.npz"
+TUTORIAL_SUBSET_SHA256 = (
+    "84a0f9c2bb0d1ff793a2ffc2c2e1ee4671d46fe1d61a07f83d93bd0f4bd1b1fb"
+)
+TUTORIAL_SUBSET_URL = (
+    "https://zenodo.org/records/22099234/files/"
+    f"{TUTORIAL_SUBSET_FILENAME}?download=1"
+)
 
 
 @dataclass
@@ -45,7 +57,9 @@ class WorkflowConfig:
     metric_samples: int = 20_000
     tolerance: float = 1e-3
     device: str = "auto"
+    cpu_threads: int | None = None
     preload: bool = False
+    cache_inference: bool = True
     make_plots: bool = True
 
 
@@ -75,8 +89,16 @@ class PairDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         self.features_path = data_dir / f"{split}_features.npy"
         self.targets_path = data_dir / f"{split}_targets.npy"
         if not self.features_path.is_file() or not self.targets_path.is_file():
+            missing = [
+                str(path)
+                for path in (self.features_path, self.targets_path)
+                if not path.is_file()
+            ]
             raise FileNotFoundError(
-                f"Expected {self.features_path.name} and {self.targets_path.name}"
+                "Missing pair data: "
+                + ", ".join(missing)
+                + ". Download all six release arrays described in README.md, or "
+                "use prepare_demo_data(...) to extract the real tutorial subset."
             )
         self.features = np.load(self.features_path, mmap_mode="r")
         self.targets = np.load(self.targets_path, mmap_mode="r")
@@ -265,6 +287,149 @@ def subset_indices(length: int, limit: int | None, seed: int) -> np.ndarray:
     return np.sort(np.random.default_rng(seed).choice(length, limit, replace=False))
 
 
+def expected_data_paths(data_dir: Path) -> tuple[Path, ...]:
+    """Return the six NumPy files consumed by the workflow."""
+
+    return tuple(
+        data_dir / f"{split}_{kind}.npy"
+        for split in DATA_SPLITS
+        for kind in ("features", "targets")
+    )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validated_subset_metadata(archive: np.lib.npyio.NpzFile) -> dict:
+    expected_keys = {
+        f"{split}_{kind}" for split in DATA_SPLITS for kind in ("features", "targets")
+    }
+    missing = expected_keys.difference(archive.files)
+    if missing or "metadata_json" not in archive.files:
+        raise ValueError(
+            "Tutorial subset archive is missing: " + ", ".join(sorted(missing))
+        )
+    metadata = json.loads(str(archive["metadata_json"]))
+    if metadata.get("format") != "ma-pfn-real-tutorial-subset":
+        raise ValueError("Unrecognized tutorial subset format")
+    for split in DATA_SPLITS:
+        features = archive[f"{split}_features"]
+        targets = archive[f"{split}_targets"]
+        if features.ndim != 3 or features.shape[-1] != 4:
+            raise ValueError(f"Invalid {split} feature shape in tutorial subset")
+        if targets.ndim != 1 or len(features) != len(targets):
+            raise ValueError(f"Mismatched {split} arrays in tutorial subset")
+    return metadata
+
+
+def _download_subset(url: str, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".part")
+    try:
+        with urlopen(url, timeout=60) as response, temporary.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _extract_subset(archive_path: Path, data_dir: Path) -> dict:
+    actual_digest = _sha256(archive_path)
+    if actual_digest != TUTORIAL_SUBSET_SHA256:
+        raise ValueError(
+            f"Checksum mismatch for {archive_path}: expected "
+            f"{TUTORIAL_SUBSET_SHA256}, found {actual_digest}"
+        )
+    data_dir.mkdir(parents=True, exist_ok=True)
+    with np.load(archive_path, allow_pickle=False) as archive:
+        metadata = _validated_subset_metadata(archive)
+        for split in DATA_SPLITS:
+            for kind in ("features", "targets"):
+                np.save(data_dir / f"{split}_{kind}.npy", archive[f"{split}_{kind}"])
+    (data_dir / "tutorial_subset.json").write_text(
+        json.dumps(metadata, indent=2) + "\n"
+    )
+    return metadata
+
+
+def prepare_demo_data(
+    requested_dir: Path,
+    fallback_dir: Path,
+    subset_archive: Path | None = None,
+    subset_url: str | None = TUTORIAL_SUBSET_URL,
+) -> dict:
+    """Use complete supplied arrays or extract the real release-data subset.
+
+    A partially populated supplied directory is treated as an error because
+    silently combining different releases would invalidate the split contract.
+    The compact archive retains all pairs among selected source events from each
+    original event-disjoint split and copies the corresponding exact EMD targets.
+    """
+
+    requested_dir = Path(requested_dir)
+    fallback_dir = Path(fallback_dir)
+    requested_paths = expected_data_paths(requested_dir)
+    present = [path.is_file() for path in requested_paths]
+    if all(present):
+        return {
+            "kind": "full_release",
+            "extracted": False,
+            "data_dir": str(requested_dir),
+            "description": "supplied train/validation/test NumPy arrays",
+        }
+    if any(present):
+        missing = [str(path) for path, exists in zip(requested_paths, present) if not exists]
+        raise FileNotFoundError(
+            "The supplied data directory is incomplete; missing " + ", ".join(missing)
+        )
+
+    fallback_paths = expected_data_paths(fallback_dir)
+    metadata_path = fallback_dir / "tutorial_subset.json"
+    reusable = all(path.is_file() for path in fallback_paths) and metadata_path.is_file()
+    if reusable:
+        metadata = json.loads(metadata_path.read_text())
+        reusable = (
+            metadata.get("format") == "ma-pfn-real-tutorial-subset"
+            and metadata.get("version") == 3
+        )
+    if not reusable:
+        archive_path = (
+            Path(subset_archive)
+            if subset_archive is not None
+            else Path(__file__).resolve().with_name(TUTORIAL_SUBSET_FILENAME)
+        )
+        archive_source = "bundled"
+        if not archive_path.is_file():
+            if subset_url is None:
+                raise FileNotFoundError(
+                    f"Tutorial subset archive not found: {archive_path}"
+                )
+            archive_path = fallback_dir / TUTORIAL_SUBSET_FILENAME
+            archive_source = "zenodo"
+            if not archive_path.is_file():
+                print(f"Downloading the real tutorial subset from {subset_url}")
+                _download_subset(subset_url, archive_path)
+        metadata = _extract_subset(archive_path, fallback_dir)
+    else:
+        archive_source = "extracted_cache"
+
+    return {
+        "kind": "real_tutorial_subset",
+        "extracted": not reusable,
+        "archive_source": archive_source,
+        "data_dir": str(fallback_dir),
+        "description": metadata["selection"],
+        "source": metadata["source"],
+        "splits": metadata["splits"],
+    }
+
+
 def predict_features(
     model: nn.Module,
     features: np.ndarray,
@@ -339,6 +504,168 @@ def predict_event_pairs(
     return prediction
 
 
+@dataclass(frozen=True)
+class EventLatentCache:
+    """Resident event latents used by the timing-benchmark inference path."""
+
+    first_role: torch.Tensor
+    second_role: torch.Tensor
+    encoding_passes: int
+
+
+@dataclass(frozen=True)
+class ResidentPairIndices:
+    """Pair indices transferred once and retained beside cached latents."""
+
+    first: torch.Tensor
+    second: torch.Tensor
+
+
+def build_event_latent_cache(
+    model: nn.Module, events: np.ndarray, device: torch.device
+) -> EventLatentCache:
+    """Transfer and encode each unique event before evaluating any pairs.
+
+    MA-PFN does not expose the event tag to its particle encoder, so one shared
+    latent bank serves both pair roles. The stock PFN learns the tag, requiring
+    one cached bank for the ``-1`` role and one for the ``+1`` role.
+    """
+
+    event_tensor = torch.from_numpy(
+        np.ascontiguousarray(events, dtype=np.float32)
+    ).to(device)
+    with torch.inference_mode():
+        if isinstance(model, PFN):
+            first = model.encode_events(event_tensor, event_id=-1.0)
+            second = model.encode_events(event_tensor, event_id=1.0)
+            return EventLatentCache(first, second, encoding_passes=2)
+        if not isinstance(model, MAPFN):
+            raise TypeError(
+                f"Cached inference is unsupported for {type(model).__name__}"
+            )
+        shared = model.encode_events(event_tensor)
+        return EventLatentCache(shared, shared, encoding_passes=1)
+
+
+def build_banked_event_latent_cache(
+    model: nn.Module,
+    first_events: np.ndarray,
+    second_events: np.ndarray,
+    device: torch.device,
+) -> EventLatentCache:
+    """Encode two event banks separately, matching the timing-study setup."""
+
+    first_tensor = torch.from_numpy(
+        np.ascontiguousarray(first_events, dtype=np.float32)
+    ).to(device)
+    second_tensor = torch.from_numpy(
+        np.ascontiguousarray(second_events, dtype=np.float32)
+    ).to(device)
+    return _encode_banked_event_tensors(model, first_tensor, second_tensor)
+
+
+def _encode_banked_event_tensors(
+    model: nn.Module,
+    first_events: torch.Tensor,
+    second_events: torch.Tensor,
+) -> EventLatentCache:
+    with torch.inference_mode():
+        if isinstance(model, PFN):
+            first = model.encode_events(first_events, event_id=-1.0)
+            second = model.encode_events(second_events, event_id=1.0)
+        elif isinstance(model, MAPFN):
+            first = model.encode_events(first_events)
+            second = model.encode_events(second_events)
+        else:
+            raise TypeError(
+                f"Cached inference is unsupported for {type(model).__name__}"
+            )
+    return EventLatentCache(first, second, encoding_passes=2)
+
+
+def build_resident_pair_indices(
+    first_indices: np.ndarray,
+    second_indices: np.ndarray,
+    device: torch.device,
+) -> ResidentPairIndices:
+    if len(first_indices) != len(second_indices):
+        raise ValueError("First and second pair-index arrays must have equal length")
+    first = torch.from_numpy(
+        np.ascontiguousarray(first_indices, dtype=np.int64)
+    ).to(device)
+    second = torch.from_numpy(
+        np.ascontiguousarray(second_indices, dtype=np.int64)
+    ).to(device)
+    return ResidentPairIndices(first, second)
+
+
+def predict_resident_cached_pairs(
+    model: nn.Module,
+    cache: EventLatentCache,
+    indices: ResidentPairIndices,
+    batch_size: int,
+) -> np.ndarray:
+    """Evaluate cached latents with pair indices already resident on-device."""
+
+    pair_count = indices.first.numel()
+    prediction = np.empty(pair_count, dtype=np.float32)
+    with torch.inference_mode():
+        for start in range(0, pair_count, batch_size):
+            stop = min(start + batch_size, pair_count)
+            first = cache.first_role.index_select(0, indices.first[start:stop])
+            second = cache.second_role.index_select(0, indices.second[start:stop])
+            prediction[start:stop] = (
+                model.pairwise_from_latents(first, second).float().cpu().numpy()
+            )
+    return prediction
+
+
+def _predict_resident_encoded_pairs(
+    model: nn.Module,
+    first_events: torch.Tensor,
+    second_events: torch.Tensor,
+    indices: ResidentPairIndices,
+    batch_size: int,
+) -> np.ndarray:
+    """Run the full particle encoder with events and indices already resident."""
+
+    pair_count = indices.first.numel()
+    prediction = np.empty(pair_count, dtype=np.float32)
+    with torch.inference_mode():
+        for start in range(0, pair_count, batch_size):
+            stop = min(start + batch_size, pair_count)
+            first = first_events.index_select(0, indices.first[start:stop])
+            second = second_events.index_select(0, indices.second[start:stop])
+            first = nn.functional.pad(first, (0, 1), value=-1.0)
+            second = nn.functional.pad(second, (0, 1), value=1.0)
+            pair = torch.cat((first, second), dim=1)
+            prediction[start:stop] = model(pair).float().cpu().numpy()
+    return prediction
+
+
+def predict_cached_pairs(
+    model: nn.Module,
+    cache: EventLatentCache,
+    first_indices: np.ndarray,
+    second_indices: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+) -> np.ndarray:
+    """Gather resident latents and evaluate only the pairwise regression head."""
+
+    indices = build_resident_pair_indices(first_indices, second_indices, device)
+    return predict_resident_cached_pairs(model, cache, indices, batch_size)
+
+
+def combination_pair_indices(
+    event_count: int, selected_rows: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map rows in combinations order back to their two source-event indices."""
+
+    first, second = np.triu_indices(event_count, k=1)
+    return first[selected_rows], second[selected_rows]
+
+
 def distinct_rows(
     event_count: int, sample_count: int, width: int, rng: np.random.Generator
 ) -> np.ndarray:
@@ -368,27 +695,58 @@ def regression_summary(target: np.ndarray, prediction: np.ndarray) -> dict[str, 
 def benchmark_models(
     models: dict[str, nn.Module], config: WorkflowConfig, device: torch.device
 ) -> tuple[dict, dict[str, np.ndarray]]:
-    test_features = np.load(config.data_dir / "test_features.npy", mmap_mode="r")
     test_targets = np.load(config.data_dir / "test_targets.npy", mmap_mode="r")
     test_indices = subset_indices(
         len(test_targets), config.max_test_pairs, config.seed + 20
     )
     target = np.asarray(test_targets[test_indices], dtype=np.float32)
+    events = reconstruct_split_events(config.data_dir)
+
+    test_features: np.ndarray | None = None
+    test_first: np.ndarray | None = None
+    test_second: np.ndarray | None = None
+    if config.cache_inference:
+        test_first, test_second = combination_pair_indices(len(events), test_indices)
+    else:
+        test_features = np.load(
+            config.data_dir / "test_features.npy", mmap_mode="r"
+        )
 
     arrays: dict[str, np.ndarray] = {
         "test_indices": test_indices,
         "target": target,
     }
     accuracy: dict[str, dict[str, float]] = {}
+    latent_caches: dict[str, EventLatentCache] = {}
     for name, model in models.items():
-        print(f"Predicting {len(test_indices):,} held-out pairs with {MODEL_LABELS[name]}")
-        prediction = predict_features(
-            model, test_features, test_indices, config.batch_size, device
-        )
+        if config.cache_inference:
+            print(
+                f"Caching {len(events):,} unique test-event latents for "
+                f"{MODEL_LABELS[name]}"
+            )
+            cache = build_event_latent_cache(model, events, device)
+            latent_caches[name] = cache
+            assert test_first is not None and test_second is not None
+            prediction = predict_cached_pairs(
+                model,
+                cache,
+                test_first,
+                test_second,
+                config.batch_size,
+                device,
+            )
+        else:
+            print(
+                f"Predicting {len(test_indices):,} held-out paired tensors with "
+                f"{MODEL_LABELS[name]}"
+            )
+            assert test_features is not None
+            prediction = predict_features(
+                model, test_features, test_indices, config.batch_size, device
+            )
         arrays[f"prediction_{name}"] = prediction
         accuracy[name] = regression_summary(target, prediction)
 
-    events = reconstruct_split_events(config.data_dir)
     rng = np.random.default_rng(config.seed + 30)
     pairs = distinct_rows(len(events), config.metric_samples, 2, rng)
     triplets = distinct_rows(len(events), config.metric_samples, 3, rng)
@@ -406,27 +764,27 @@ def benchmark_models(
     metric_summary: dict[str, dict[str, float | int]] = {}
     for name, model in models.items():
         print(f"Benchmarking metric properties for {MODEL_LABELS[name]}")
-        forward = predict_event_pairs(
-            model, events, pairs[:, 0], pairs[:, 1], config.batch_size, device
-        )
-        reverse = predict_event_pairs(
-            model, events, pairs[:, 1], pairs[:, 0], config.batch_size, device
-        )
-        self_distance = predict_event_pairs(
-            model, events, identity, identity, config.batch_size, device
-        )
-        sides = []
-        for first, second in ((0, 1), (1, 2), (0, 2)):
-            sides.append(
-                predict_event_pairs(
+
+        def predict(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+            if config.cache_inference:
+                return predict_cached_pairs(
                     model,
-                    events,
-                    triplets[:, first],
-                    triplets[:, second],
+                    latent_caches[name],
+                    first,
+                    second,
                     config.batch_size,
                     device,
                 )
+            return predict_event_pairs(
+                model, events, first, second, config.batch_size, device
             )
+
+        forward = predict(pairs[:, 0], pairs[:, 1])
+        reverse = predict(pairs[:, 1], pairs[:, 0])
+        self_distance = predict(identity, identity)
+        sides = []
+        for first, second in ((0, 1), (1, 2), (0, 2)):
+            sides.append(predict(triplets[:, first], triplets[:, second]))
         triangle_sides = np.stack(sides, axis=1)
         largest = np.max(triangle_sides, axis=1)
         triangle_residual = largest - (np.sum(triangle_sides, axis=1) - largest)
@@ -469,9 +827,206 @@ def benchmark_models(
             "identity_event_count": len(identity),
             "tolerance_gev": config.tolerance,
             "seed": config.seed,
+            "inference_mode": (
+                "cached_event_latents" if config.cache_inference else "paired_tensors"
+            ),
+            "cache_scope": "held_out_test_events" if config.cache_inference else None,
+            "event_encoding_passes": {
+                name: cache.encoding_passes for name, cache in latent_caches.items()
+            },
         },
     }
     return summary, arrays
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def benchmark_inference_throughput(
+    config: WorkflowConfig,
+    events_per_bank: int = 64,
+    repetitions: int = 3,
+) -> dict:
+    """Compare pair re-encoding with cold and resident-cache inference.
+
+    The workload contains all cross pairs between two disjoint event banks.
+    Event tensors and pair indices are transferred once for both paths, as in
+    the timing study. Both paths return every prediction to host memory. The
+    cached cold-start result includes that common transfer plus event encoding,
+    while its resident result times only lookup and the pairwise head.
+    """
+
+    if events_per_bank <= 0 or repetitions <= 0:
+        raise ValueError("events_per_bank and repetitions must be positive")
+
+    device = select_device(config.device)
+    events = reconstruct_split_events(Path(config.data_dir))
+    required_events = 2 * events_per_bank
+    if required_events > len(events):
+        raise ValueError(
+            f"Need {required_events} held-out events, but found only {len(events)}"
+        )
+
+    rng = np.random.default_rng(config.seed + 40)
+    selected = rng.choice(len(events), required_events, replace=False)
+    first_events = np.ascontiguousarray(
+        events[selected[:events_per_bank]], dtype=np.float32
+    )
+    second_events = np.ascontiguousarray(
+        events[selected[events_per_bank:]], dtype=np.float32
+    )
+    first_indices = np.repeat(
+        np.arange(events_per_bank, dtype=np.int64), events_per_bank
+    )
+    second_indices = np.tile(
+        np.arange(events_per_bank, dtype=np.int64), events_per_bank
+    )
+    pair_count = len(first_indices)
+    warm_count = min(pair_count, config.batch_size)
+    output: dict = {
+        "configuration": {
+            "device": str(device),
+            "events_per_bank": events_per_bank,
+            "unique_event_count": required_events,
+            "pair_count": pair_count,
+            "batch_size": config.batch_size,
+            "repetitions": repetitions,
+            "selected_source_event_indices": selected.tolist(),
+            "workload": "all cross pairs between two disjoint event banks",
+            "timing": "wall time; median after warm-up; predictions returned to host",
+            "baseline": "resident events and indices; particle encoder run per pair",
+        },
+        "models": {},
+    }
+
+    for name, label in MODEL_LABELS.items():
+        model = load_checkpoint(
+            Path(config.output_dir) / name / "best_model.pt", device
+        )
+
+        _synchronize(device)
+        start = time.perf_counter()
+        first_tensor = torch.from_numpy(first_events).to(device)
+        second_tensor = torch.from_numpy(second_events).to(device)
+        resident_indices = build_resident_pair_indices(
+            first_indices, second_indices, device
+        )
+        _synchronize(device)
+        resident_setup_seconds = time.perf_counter() - start
+
+        # Warm the full pair-encoding path once before collecting timings.
+        warm_indices = ResidentPairIndices(
+            resident_indices.first[:warm_count], resident_indices.second[:warm_count]
+        )
+        _predict_resident_encoded_pairs(
+            model,
+            first_tensor,
+            second_tensor,
+            warm_indices,
+            config.batch_size,
+        )
+        paired_times = []
+        paired_prediction = np.empty(0, dtype=np.float32)
+        for _ in range(repetitions):
+            _synchronize(device)
+            start = time.perf_counter()
+            paired_prediction = _predict_resident_encoded_pairs(
+                model,
+                first_tensor,
+                second_tensor,
+                resident_indices,
+                config.batch_size,
+            )
+            _synchronize(device)
+            paired_times.append(time.perf_counter() - start)
+
+        _synchronize(device)
+        start = time.perf_counter()
+        cache = _encode_banked_event_tensors(model, first_tensor, second_tensor)
+        _synchronize(device)
+        cache_setup_seconds = time.perf_counter() - start
+
+        predict_resident_cached_pairs(
+            model, cache, warm_indices, config.batch_size
+        )
+        cached_times = []
+        cached_prediction = np.empty(0, dtype=np.float32)
+        for _ in range(repetitions):
+            _synchronize(device)
+            start = time.perf_counter()
+            cached_prediction = predict_resident_cached_pairs(
+                model, cache, resident_indices, config.batch_size
+            )
+            _synchronize(device)
+            cached_times.append(time.perf_counter() - start)
+
+        max_difference = float(
+            np.max(np.abs(paired_prediction - cached_prediction), initial=0.0)
+        )
+        if not np.allclose(
+            paired_prediction, cached_prediction, rtol=2e-5, atol=2e-5
+        ):
+            raise RuntimeError(
+                f"Cached and re-encoded {label} predictions disagree "
+                f"(max absolute difference {max_difference:.3g} GeV)"
+            )
+
+        paired_seconds = float(np.median(paired_times))
+        cached_seconds = float(np.median(cached_times))
+        paired_rate = pair_count / paired_seconds
+        resident_rate = pair_count / cached_seconds
+        paired_cold_rate = pair_count / (resident_setup_seconds + paired_seconds)
+        cold_rate = pair_count / (
+            resident_setup_seconds + cache_setup_seconds + cached_seconds
+        )
+        output["models"][name] = {
+            "label": label,
+            "event_encoding_passes": cache.encoding_passes,
+            "resident_input_setup_seconds": resident_setup_seconds,
+            "cache_encoding_seconds": cache_setup_seconds,
+            "pair_encoding_seconds": paired_seconds,
+            "cached_resident_seconds": cached_seconds,
+            "pair_encoding_cold_pairs_per_second": paired_cold_rate,
+            "pair_encoding_resident_pairs_per_second": paired_rate,
+            "cached_cold_pairs_per_second": cold_rate,
+            "cached_resident_pairs_per_second": resident_rate,
+            "cached_cold_speedup": cold_rate / paired_cold_rate,
+            "cached_resident_speedup": resident_rate / paired_rate,
+            "max_abs_prediction_difference_gev": max_difference,
+            "pair_encoding_repetition_seconds": paired_times,
+            "cached_resident_repetition_seconds": cached_times,
+        }
+
+    print(
+        f"Inference throughput: {pair_count:,} pairs, batch={config.batch_size:,}, "
+        f"device={device}"
+    )
+    print(
+        f"{'Model':<8} {'pair encode':>13} {'cached cold':>13} "
+        f"{'cached resident':>16} {'encode':>10} {'cold':>8} {'resident':>10}"
+    )
+    print(
+        f"{'':<8} {'(pairs/s)':>13} {'(pairs/s)':>13} "
+        f"{'(pairs/s)':>16} {'(ms)':>10} {'speedup':>8} {'speedup':>10}"
+    )
+    for metrics in output["models"].values():
+        print(
+            f"{metrics['label']:<8} "
+            f"{metrics['pair_encoding_resident_pairs_per_second']:>10,.0f} p/s "
+            f"{metrics['cached_cold_pairs_per_second']:>10,.0f} p/s "
+            f"{metrics['cached_resident_pairs_per_second']:>13,.0f} p/s "
+            f"{1_000 * metrics['cache_encoding_seconds']:>8.2f} "
+            f"{metrics['cached_cold_speedup']:>7.2f}x "
+            f"{metrics['cached_resident_speedup']:>9.2f}x"
+        )
+    print("Cold cached throughput includes one cache setup for this workload.")
+
+    output_path = Path(config.output_dir) / "inference_throughput.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(output, indent=2) + "\n")
+    return output
 
 
 def plot_training(histories: dict[str, dict], output_dir: Path) -> None:
@@ -645,6 +1200,8 @@ def validate_config(config: WorkflowConfig) -> None:
         raise ValueError("epochs and batch_size must be positive")
     if config.metric_samples <= 0 or config.tolerance < 0:
         raise ValueError("metric_samples must be positive and tolerance non-negative")
+    if config.cpu_threads is not None and config.cpu_threads <= 0:
+        raise ValueError("cpu_threads must be positive when supplied")
 
 
 def run_workflow(config: WorkflowConfig) -> dict:
@@ -655,7 +1212,14 @@ def run_workflow(config: WorkflowConfig) -> dict:
     config.output_dir = Path(config.output_dir)
     config.output_dir.mkdir(parents=True, exist_ok=True)
     device = select_device(config.device)
-    print(f"Using {device}; data={config.data_dir}; output={config.output_dir}")
+    if device.type == "cpu" and config.cpu_threads is not None:
+        torch.set_num_threads(config.cpu_threads)
+    thread_note = (
+        f" ({torch.get_num_threads()} intra-op threads)" if device.type == "cpu" else ""
+    )
+    print(
+        f"Using {device}{thread_note}; data={config.data_dir}; output={config.output_dir}"
+    )
 
     models: dict[str, nn.Module] = {}
     histories: dict[str, dict] = {}
@@ -702,6 +1266,7 @@ def run_workflow(config: WorkflowConfig) -> dict:
         "numpy": np.__version__,
         "torch": torch.__version__,
         "device": str(device),
+        "torch_intraop_threads": torch.get_num_threads(),
     }
     (config.output_dir / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     print(f"Wrote results to {config.output_dir.resolve()}")
@@ -735,23 +1300,50 @@ def parse_args() -> WorkflowConfig:
     parser.add_argument("--tolerance", type=float, default=1e-3)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        help="limit PyTorch intra-op threads (useful for small CPU demonstrations)",
+    )
+    parser.add_argument(
         "--preload",
         action="store_true",
         help="copy selected train/validation arrays to float32 RAM for faster epochs",
     )
+    parser.add_argument(
+        "--no-cache-inference",
+        action="store_true",
+        help="rebuild tagged pair tensors instead of caching unique event latents",
+    )
     parser.add_argument("--no-plots", action="store_true")
     values = vars(parser.parse_args())
+    values["cache_inference"] = not values.pop("no_cache_inference")
     values["make_plots"] = not values.pop("no_plots")
     return WorkflowConfig(**values)
 
 
 __all__ = [
+    "EventLatentCache",
     "MODEL_LABELS",
     "PairDataset",
+    "ResidentPairIndices",
+    "TUTORIAL_SUBSET_FILENAME",
+    "TUTORIAL_SUBSET_SHA256",
+    "TUTORIAL_SUBSET_URL",
     "WorkflowConfig",
+    "benchmark_inference_throughput",
     "benchmark_models",
+    "build_banked_event_latent_cache",
+    "build_event_latent_cache",
+    "build_resident_pair_indices",
+    "expected_data_paths",
     "load_checkpoint",
     "parse_args",
+    "predict_cached_pairs",
+    "predict_event_pairs",
+    "predict_resident_cached_pairs",
+    "prepare_demo_data",
+    "reconstruct_split_events",
     "run_workflow",
+    "select_device",
     "train_one_model",
 ]
