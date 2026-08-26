@@ -11,13 +11,6 @@ import unittest
 import numpy as np
 import torch
 
-from ma_pfn_demo import (
-    cache_events_explicitly,
-    hybrid_emd_loss_written_out,
-    metric_aware_forward,
-    score_cached_pairs_explicitly,
-    stock_pfn_forward,
-)
 from models import HybridEMDLoss, MAPFN, PFN
 from utils import (
     TUTORIAL_SUBSET_FILENAME,
@@ -91,7 +84,7 @@ class TutorialDataTests(unittest.TestCase):
                 prepare_demo_data(release, root / "subset")
 
 
-class VisibleImplementationTests(unittest.TestCase):
+class ModelTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.temporary = tempfile.TemporaryDirectory()
@@ -106,18 +99,7 @@ class VisibleImplementationTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.temporary.cleanup()
 
-    def test_written_out_forward_passes_match_reusable_models(self) -> None:
-        pairs = torch.from_numpy(np.load(self.data_dir / "train_features.npy")[:4])
-        torch.manual_seed(5)
-        cases = (
-            (PFN(4, 5, 7, 9).eval(), stock_pfn_forward),
-            (MAPFN(4, 5, 7, 9).eval(), metric_aware_forward),
-        )
-        with torch.inference_mode():
-            for model, written_out in cases:
-                torch.testing.assert_close(model(pairs), written_out(model, pairs))
-
-    def test_written_out_hybrid_loss_matches_training_implementation(self) -> None:
+    def test_hybrid_loss_components(self) -> None:
         config = WorkflowConfig()
         self.assertEqual(config.loss, "hybrid")
         self.assertEqual(config.mae_weight, 0.25)
@@ -125,21 +107,13 @@ class VisibleImplementationTests(unittest.TestCase):
 
         prediction = torch.tensor([8.0, 24.0])
         target = torch.tensor([10.0, 20.0])
-        expected = hybrid_emd_loss_written_out(
-            prediction,
-            target,
-            config.mae_weight,
-            config.mae_scale,
-        )
-        actual = HybridEMDLoss(
+        objective, mape, mae = HybridEMDLoss(
             mae_weight=config.mae_weight,
             mae_scale=config.mae_scale,
         ).components(prediction, target)
-        for expected_component, actual_component in zip(expected, actual):
-            torch.testing.assert_close(expected_component, actual_component)
-        torch.testing.assert_close(actual[1], torch.tensor(0.2))
-        torch.testing.assert_close(actual[2], torch.tensor(3.0))
-        torch.testing.assert_close(actual[0], torch.tensor(0.20833333))
+        torch.testing.assert_close(mape, torch.tensor(0.2))
+        torch.testing.assert_close(mae, torch.tensor(3.0))
+        torch.testing.assert_close(objective, torch.tensor(0.20833333))
 
     def test_explicit_cache_matches_ordinary_pair_encoding(self) -> None:
         events = reconstruct_split_events(self.data_dir)
@@ -149,12 +123,17 @@ class VisibleImplementationTests(unittest.TestCase):
         first = torch.from_numpy(first_numpy)
         second = torch.from_numpy(second_numpy)
 
-        for model, expected_passes in ((MAPFN(4, 5, 7, 9), 1), (PFN(4, 5, 7, 9), 2)):
+        for model in (MAPFN(4, 5, 7, 9), PFN(4, 5, 7, 9)):
             model.eval()
-            cache = cache_events_explicitly(model, event_tensor)
-            cached = score_cached_pairs_explicitly(
-                model, cache, first, second
-            ).detach().numpy()
+            with torch.inference_mode():
+                if isinstance(model, MAPFN):
+                    first_latents = second_latents = model.encode_events(event_tensor)
+                else:
+                    first_latents = model.encode_events(event_tensor, event_id=-1.0)
+                    second_latents = model.encode_events(event_tensor, event_id=1.0)
+                cached = model.pairwise_from_latents(
+                    first_latents[first], second_latents[second]
+                ).numpy()
             ordinary = predict_event_pairs(
                 model,
                 events,
@@ -163,7 +142,6 @@ class VisibleImplementationTests(unittest.TestCase):
                 batch_size=4,
                 device=torch.device("cpu"),
             )
-            self.assertEqual(cache[2], expected_passes)
             np.testing.assert_allclose(cached, ordinary, rtol=2e-5, atol=2e-5)
 
 

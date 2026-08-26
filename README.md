@@ -9,15 +9,15 @@ and metric properties. Both models use the constructed dimensionless objective
 
 ## Contents
 
-- `ma_pfn_demo.py`: readable notebook source and command-line entry point.
+- `ma_pfn_demo.py`: readable Jupytext source for the notebook.
 - `ma_pfn_demo.ipynb`: generated tutorial notebook with a short default run.
+- `run_demo.py`: command-line entry point.
 - `ma_pfn_tutorial.npz`: checksum-verified 40 MB subset of the real
   released event pairs and exact EMD targets.
 - `models.py`: side-by-side MA-PFN and stock-PFN model definitions.
 - `utils.py`: subset extraction, data loading, training, evaluation, plotting,
   and CLI helpers.
-- `test_demo.py`: fast checks that the visible notebook implementations match
-  the reusable model and cache paths.
+- `test_demo.py`: fast checks for the data, loss, and cached model path.
 - `make_notebook.py`: local Jupytext wrapper used by CI.
 - `jupytext.toml`: declares the paired `ipynb,py:percent` formats.
 - `.github/workflows/sync-notebook.yml`: regenerates and commits the notebook
@@ -114,7 +114,7 @@ remaining requirements.
 ## Run it
 
 ```bash
-python ma_pfn_demo.py \
+python run_demo.py \
   --data-dir data \
   --output-dir results \
   --device auto \
@@ -131,7 +131,7 @@ limits and use the defaults of 500 epochs, patience 50, batch size 1,024, Adam
 learning rate `1e-4`, and seed 12,345:
 
 ```bash
-python ma_pfn_demo.py \
+python run_demo.py \
   --data-dir data \
   --output-dir results \
   --device cuda \
@@ -147,8 +147,8 @@ loss can be varied explicitly with `--loss`, `--mae-weight`, and `--mae-scale`.
 Training and benchmarking can be separated without retraining:
 
 ```bash
-python ma_pfn_demo.py --stage train --data-dir data --output-dir results --device cuda
-python ma_pfn_demo.py --stage benchmark --data-dir data --output-dir results --device cuda
+python run_demo.py --stage train --data-dir data --output-dir results --device cuda
+python run_demo.py --stage benchmark --data-dir data --output-dir results --device cuda
 ```
 
 Architecture dimensions are stored in each checkpoint, so a benchmark-only
@@ -209,14 +209,11 @@ above. Its committed defaults are intentionally small, with release-scale
 values noted next to the settings that differ.
 
 The notebook includes executable, written-out versions of the stock-PFN and
-MA-PFN forward passes and verifies them against the reusable model classes. It
-also writes out the constructed hybrid-loss equation and implementation,
-checks it against the exact loss class used for training, and displays the
-objective/MAPE/MAE learning curves inline. It
-also explicitly encodes unique events, constructs the one-bank MA-PFN and
-two-role PFN caches, gathers pair latents, and checks cached predictions against
-ordinary pair encoding before timing both paths. Training-loop and plotting
-details remain in helpers so they do not obscure those ideas.
+MA-PFN forward passes, writes out the constructed hybrid-loss equation and
+implementation, and displays the objective/MAPE/MAE learning curves inline.
+It also explicitly encodes unique events, constructs the one-bank MA-PFN and
+two-role PFN caches, gathers pair latents, and times cached inference. Training
+and plotting details remain in helpers so they do not obscure those ideas.
 
 `ma_pfn_demo.py` is the source of truth for the generated notebook. To
 regenerate the notebook locally after editing its source:

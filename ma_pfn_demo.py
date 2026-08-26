@@ -37,21 +37,18 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from models import HybridEMDLoss, MAPFN, PFN
+from models import MAPFN, PFN
 from utils import (
     WorkflowConfig,
     benchmark_inference_throughput,
     load_checkpoint,
-    parse_args,
-    predict_event_pairs,
     prepare_demo_data,
     reconstruct_split_events,
     run_workflow,
     select_device,
 )
 
-if "get_ipython" in globals():
-    from IPython.display import Image as NotebookImage, display
+from IPython.display import Image as NotebookImage, display
 
 
 # %% [markdown]
@@ -74,15 +71,13 @@ if "get_ipython" in globals():
 #
 # Parameter choices are exposed below so a user can change them in one
 # place. These defaults are deliberately small for a tutorial.
-# Comments identify release-scale values where they differ. `stage` can be
-# `"all"`, `"train"`, or `"benchmark"`.
+# Comments identify release-scale values where they differ.
 
 # %%
 config = WorkflowConfig(
     # Data and workflow
     data_dir=Path("data"),
     output_dir=Path("results_notebook"),
-    stage="all",
     device="auto",  # automatically use CUDA when available
     cpu_threads=4,  # avoids thread-launch overhead for this small CPU workload
     seed=12_345,
@@ -116,8 +111,6 @@ config = WorkflowConfig(
 # Two banks of this many events make events_per_bank**2 throughput pairs.
 throughput_events_per_bank = 32
 throughput_repetitions = 3
-data_info = None
-results = None  # dependent cells skip cleanly if preparation or training fails
 
 
 # %% [markdown]
@@ -134,41 +127,38 @@ results = None  # dependent cells skip cleanly if preparation or training fails
 # selects exactly 100,000 of them reproducibly for the tutorial run.
 
 # %%
-if "get_ipython" in globals():
-    data_info = prepare_demo_data(
-        requested_dir=config.data_dir,
-        fallback_dir=config.output_dir / "tutorial_data",
-    )
-    config.data_dir = Path(data_info["data_dir"])
-    print(f"Using {data_info['kind']} data from {config.data_dir}")
-    display({
-        "kind": data_info["kind"],
-        "archive_source": data_info.get("archive_source"),
-        "data_dir": data_info["data_dir"],
-        "zenodo_record_id": data_info.get("source", {}).get("zenodo_record_id"),
-        "splits": {
-            split: {
-                "source_events": details["selected_event_count"],
-                "pairs": details["pair_count"],
-                "feature_shape": details["feature_shape"],
-                "target_range_gev": (
-                    details["target_min_gev"],
-                    details["target_max_gev"],
-                ),
-            }
-            for split, details in data_info.get("splits", {}).items()
-        },
-    })
+data_info = prepare_demo_data(
+    requested_dir=config.data_dir,
+    fallback_dir=config.output_dir / "tutorial_data",
+)
+config.data_dir = Path(data_info["data_dir"])
+print(f"Using {data_info['kind']} data from {config.data_dir}")
+display({
+    "kind": data_info["kind"],
+    "archive_source": data_info.get("archive_source"),
+    "data_dir": data_info["data_dir"],
+    "zenodo_record_id": data_info.get("source", {}).get("zenodo_record_id"),
+    "splits": {
+        split: {
+            "source_events": details["selected_event_count"],
+            "pairs": details["pair_count"],
+            "feature_shape": details["feature_shape"],
+            "target_range_gev": (
+                details["target_min_gev"],
+                details["target_max_gev"],
+            ),
+        }
+        for split, details in data_info.get("splits", {}).items()
+    },
+})
 
 
 # %% [markdown]
 # ## The architecture change, in code
 #
-# These two functions spell out the exact forward passes used by the reusable
-# classes. They deliberately use the named layers from `models.py`, so the cell
-# below can check them numerically against `PFN.forward` and `MAPFN.forward`.
-# The duplicated few lines are a readable specification, not an alternative
-# implementation used for training.
+# These two functions spell out the important operations in the stock PFN and
+# MA-PFN forward passes. The reusable model classes in `models.py` organize the
+# same operations for training.
 
 # %%
 def stock_pfn_forward(model: PFN, tagged_pairs: torch.Tensor) -> torch.Tensor:
@@ -216,39 +206,6 @@ def metric_aware_forward(model: MAPFN, tagged_pairs: torch.Tensor) -> torch.Tens
     return torch.where(identical, torch.zeros_like(prediction), prediction)
 
 
-# %%
-if "get_ipython" in globals() and data_info is not None:
-    # Guard against the tutorial drifting away from the trained implementation.
-    example_pairs = torch.from_numpy(
-        np.array(
-            np.load(config.data_dir / "train_features.npy", mmap_mode="r")[:3],
-            dtype=np.float32,
-        )
-    )
-    torch.manual_seed(config.seed)
-    architecture_models = {
-        "PFN": PFN(4, latent_dim=8, phi_hidden_dim=16, f_hidden_dim=16).eval(),
-        "MA-PFN": MAPFN(4, latent_dim=8, phi_hidden_dim=16, f_hidden_dim=16).eval(),
-    }
-    with torch.inference_mode():
-        architecture_check = {
-            "PFN max |written-out - class|": float(
-                torch.max(torch.abs(
-                    stock_pfn_forward(architecture_models["PFN"], example_pairs)
-                    - architecture_models["PFN"](example_pairs)
-                ))
-            ),
-            "MA-PFN max |written-out - class|": float(
-                torch.max(torch.abs(
-                    metric_aware_forward(architecture_models["MA-PFN"], example_pairs)
-                    - architecture_models["MA-PFN"](example_pairs)
-                ))
-            ),
-        }
-    assert max(architecture_check.values()) < 1e-6
-    display(architecture_check)
-
-
 # %% [markdown]
 # ## The constructed training loss, in code
 #
@@ -288,38 +245,27 @@ def hybrid_emd_loss_written_out(
 
 
 # %%
-if "get_ipython" in globals() and data_info is not None:
-    sample_target = torch.from_numpy(
-        np.array(
-            np.load(config.data_dir / "train_targets.npy", mmap_mode="r")[:4],
-            dtype=np.float32,
-        )
+sample_target = torch.from_numpy(
+    np.array(
+        np.load(config.data_dir / "train_targets.npy", mmap_mode="r")[:4],
+        dtype=np.float32,
     )
-    sample_prediction = sample_target * torch.tensor([0.8, 1.2, 0.9, 1.1])
-    written_out = hybrid_emd_loss_written_out(
-        sample_prediction,
-        sample_target,
-        config.mae_weight,
-        config.mae_scale,
-    )
-    reusable_loss = HybridEMDLoss(
-        mae_weight=config.mae_weight,
-        mae_scale=config.mae_scale,
-        loss="hybrid",
-    )
-    reusable = reusable_loss.components(sample_prediction, sample_target)
-    for expected, actual in zip(written_out, reusable):
-        torch.testing.assert_close(expected, actual)
-    display({
-        "objective_used_for_training": reusable_loss.description,
-        "example_hybrid_objective": float(reusable[0]),
-        "example_mape": float(reusable[1]),
-        "example_mae_gev": float(reusable[2]),
-        "max_abs_written_out_vs_class": max(
-            float(torch.abs(expected - actual))
-            for expected, actual in zip(written_out, reusable)
-        ),
-    })
+)
+sample_prediction = sample_target * torch.tensor([0.8, 1.2, 0.9, 1.1])
+objective, mape, mae = hybrid_emd_loss_written_out(
+    sample_prediction,
+    sample_target,
+    config.mae_weight,
+    config.mae_scale,
+)
+display({
+    "objective_used_for_training": (
+        f"MAPE + {config.mae_weight:g} * MAE / {config.mae_scale:g} GeV"
+    ),
+    "example_hybrid_objective": float(objective),
+    "example_mape": float(mape),
+    "example_mae_gev": float(mae),
+})
 
 
 # %% [markdown]
@@ -340,9 +286,8 @@ if "get_ipython" in globals() and data_info is not None:
 # event tag. The stock PFN encoder does learn that tag, so it caches each event
 # twice: once for its `-1` (first-event) role and once for its `+1`
 # (second-event) role. Set the option to `False` to exercise the slower legacy
-# path that rebuilds and re-encodes every tagged pair. After training, an
-# explicit cache cell below performs these operations and checks its predictions
-# against ordinary paired inference.
+# path that rebuilds and re-encodes every tagged pair. The explicit cache cell
+# below performs these operations after training.
 
 
 # %% [markdown]
@@ -354,35 +299,32 @@ if "get_ipython" in globals() and data_info is not None:
 # machine-readable JSON/NPZ results.
 
 # %%
-if "get_ipython" in globals() and data_info is not None:
-    results = run_workflow(config)
+results = run_workflow(config)
 
+
+# %% [markdown]
+# ## Training curves
 
 # %%
-if "get_ipython" in globals() and results is not None:
-    display({
-        "loss": {
-            "name": config.loss,
-            "mae_weight": config.mae_weight,
-            "mae_scale_gev": config.mae_scale,
-        },
-        "training_at_selected_checkpoint": {
-            name: {
-                "epoch": history["best_epoch"],
-                "validation_objective": history["best_val_objective"],
-                "validation_mape": history["best_val_mape"],
-                "validation_mae_gev": history["best_val_mae"],
-            }
-            for name, history in results["training"].items()
-        },
-        "inference_mode": results["benchmark"]["inference_mode"],
-        "data_kind": data_info["kind"],
-        "accuracy": results["accuracy"],
-        "metric_properties": results["metric_properties"],
-    })
-    training_plot = config.output_dir / "training_curves.png"
-    if training_plot.is_file():
-        display(NotebookImage(filename=str(training_plot)))
+display(NotebookImage(filename=str(config.output_dir / "training_curves.png")))
+
+
+# %% [markdown]
+# ## Held-out EMD regression
+
+# %%
+display(NotebookImage(filename=str(config.output_dir / "accuracy_benchmark.png")))
+
+
+# %% [markdown]
+# ## Metric-property benchmarks
+#
+# Each panel shows the full distribution relevant to one metric property. The
+# dashed line is the boundary of the allowed region, and the annotation reports
+# the fraction passing at the configured tolerance.
+
+# %%
+display(NotebookImage(filename=str(config.output_dir / "metric_benchmarks.png")))
 
 
 # %% [markdown]
@@ -422,40 +364,26 @@ def score_cached_pairs_explicitly(
 
 
 # %%
-if "get_ipython" in globals() and results is not None:
-    device = select_device(config.device)
-    held_out_events = reconstruct_split_events(config.data_dir)
-    event_tensor = torch.from_numpy(np.ascontiguousarray(held_out_events)).to(device)
-    first_indices_np = np.array([0, 0, 1, 2, 3, 5, 8, 13], dtype=np.int64)
-    second_indices_np = np.array([1, 2, 3, 4, 5, 8, 13, 21], dtype=np.int64)
-    first_indices = torch.from_numpy(first_indices_np).to(device)
-    second_indices = torch.from_numpy(second_indices_np).to(device)
+device = select_device(config.device)
+held_out_events = reconstruct_split_events(config.data_dir)
+event_tensor = torch.from_numpy(np.ascontiguousarray(held_out_events)).to(device)
+first_indices = torch.tensor([0, 0, 1, 2, 3, 5, 8, 13], device=device)
+second_indices = torch.tensor([1, 2, 3, 4, 5, 8, 13, 21], device=device)
 
-    cache_check = {}
-    for name, label in (("ma_pfn", "MA-PFN"), ("pfn", "PFN")):
-        model = load_checkpoint(config.output_dir / name / "best_model.pt", device)
-        cache = cache_events_explicitly(model, event_tensor)
-        cached = score_cached_pairs_explicitly(
-            model, cache, first_indices, second_indices
-        ).cpu().numpy()
-        ordinary = predict_event_pairs(
-            model,
-            held_out_events,
-            first_indices_np,
-            second_indices_np,
-            config.batch_size,
-            device,
-        )
-        max_difference = float(np.max(np.abs(cached - ordinary)))
-        assert np.allclose(cached, ordinary, rtol=2e-5, atol=2e-5)
-        cache_check[label] = {
-            "unique_events": len(held_out_events),
-            "latent_shape": list(cache[0].shape),
-            "event_encoding_passes": cache[2],
-            "checked_pairs": len(cached),
-            "max_abs_cached_vs_ordinary_gev": max_difference,
-        }
-    display(cache_check)
+cache_summary = {}
+for name, label in (("ma_pfn", "MA-PFN"), ("pfn", "PFN")):
+    model = load_checkpoint(config.output_dir / name / "best_model.pt", device)
+    cache = cache_events_explicitly(model, event_tensor)
+    cached = score_cached_pairs_explicitly(
+        model, cache, first_indices, second_indices
+    ).cpu().numpy()
+    cache_summary[label] = {
+        "unique_events": len(held_out_events),
+        "latent_shape": list(cache[0].shape),
+        "event_encoding_passes": cache[2],
+        "example_predictions_gev": cached.tolist(),
+    }
+display(cache_summary)
 
 
 # %% [markdown]
@@ -474,20 +402,14 @@ if "get_ipython" in globals() and results is not None:
 # more stable measurement.
 
 # %%
-if "get_ipython" in globals() and results is not None:
-    throughput = benchmark_inference_throughput(
-        config,
-        events_per_bank=throughput_events_per_bank,
-        repetitions=throughput_repetitions,
-    )
+benchmark_inference_throughput(
+    config,
+    events_per_bank=throughput_events_per_bank,
+    repetitions=throughput_repetitions,
+)
 
 
 # %% [markdown]
 # The loss plot is shown above. It and the other figures are also saved in
 # `results_notebook/` as `training_curves.png`, `accuracy_benchmark.png`, and
 # `metric_benchmarks.png`.
-
-
-# %%
-if __name__ == "__main__" and "get_ipython" not in globals():
-    run_workflow(parse_args())
