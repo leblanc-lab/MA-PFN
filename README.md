@@ -1,15 +1,10 @@
 # Minimal MA-PFN example
 
-This directory is a self-contained, release-oriented example of the
+This directory is a self-contained example of the
 metric-aware particle flow network (MA-PFN) used to regress energy mover's
 distance (EMD). It trains MA-PFN and the original unconstrained PFN with the
 same data split and optimizer settings, then compares their held-out accuracy
 and metric properties.
-
-The notebook is deliberately short: it contains only the experiment narrative,
-configuration, workflow call, and result summary. The model definitions and
-reusable experiment machinery live in ordinary Python modules, so the
-command-line and interactive versions still share one implementation.
 
 ## Contents
 
@@ -86,8 +81,6 @@ remaining requirements.
 
 ## Run it
 
-A short end-to-end smoke run is:
-
 ```bash
 python ma_pfn_demo.py \
   --data-dir data \
@@ -158,7 +151,7 @@ tolerance for pass/fail decisions is `1e-3` GeV.
 
 ## Notebook
 
-Open `ma_pfn_demo.ipynb`, edit the single, fully explicit `config` cell, and run
+Open `ma_pfn_demo.ipynb`, edit the `config` cell, and run
 all cells. Its committed defaults are intentionally small, with release-scale
 values noted next to the settings that differ. `ma_pfn_demo.py` is the source
 of truth for the generated notebook; `models.py` and `utils.py` hold the
@@ -185,22 +178,3 @@ workflow while `ma-pfn-minimal/` remains nested inside a different repository.
 Do not edit generated notebook code directly. Change the notebook-facing cells
 in `ma_pfn_demo.py`; change models or reusable workflow code in `models.py` or
 `utils.py`.
-
-## Reproducibility and release checklist
-
-- Upload the dataset directly from OSCAR with
-  `./zenodo/upload_to_zenodo.sh`. The script defaults to draft record
-  `22099234`, prompts securely for a Zenodo token, verifies file sizes, and
-  leaves publication as a manual step. Run it first with `--dry-run` to inspect
-  the files without contacting Zenodo. Use `--help` to override the draft ID or
-  data directory.
-- Upload `zenodo/checksums.sha256` alongside the six arrays.
-- Fill every remaining `[TODO]` field in `zenodo/DATASET_DESCRIPTION.md`,
-  especially the authors, license, paper DOI, array-derivation details, and
-  split provenance.
-- Add the chosen code license as `LICENSE`. The data license belongs in the
-  Zenodo record and may differ from the code license.
-- Run the smoke command in a fresh environment and archive `summary.json` with
-  the paper's reference outputs.
-- GPU reductions can vary slightly across hardware and PyTorch/CUDA versions;
-  the saved seed and environment metadata make those differences auditable.
