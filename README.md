@@ -1,30 +1,56 @@
 # Minimal MA-PFN example
 
-This directory is a self-contained, release-oriented example of the
+This directory is a self-contained example of the
 metric-aware particle flow network (MA-PFN) used to regress energy mover's
 distance (EMD). It trains MA-PFN and the original unconstrained PFN with the
 same data split and optimizer settings, then compares their held-out accuracy
-and metric properties.
-
-The example deliberately contains one implementation file. The notebook is a
-generated view of that file, so the command-line and interactive versions do
-not maintain separate model definitions.
+and metric properties. Both models use the constructed dimensionless objective
+`MAPE + 0.25 * MAE / 90 GeV`, matching the production hybrid-loss controls.
 
 ## Contents
 
-- `ma_pfn_demo.py`: models, training loop, evaluation, plots, and CLI.
-- `ma_pfn_demo.ipynb`: generated notebook with a short default run.
+- `ma_pfn_demo.py`: readable Jupytext source for the notebook.
+- `ma_pfn_demo.ipynb`: generated tutorial notebook with a short default run.
+- `run_demo.py`: command-line entry point.
+- `ma_pfn_tutorial.npz`: checksum-verified 40 MB subset of the real
+  released event pairs and exact EMD targets.
+- `models.py`: side-by-side MA-PFN and stock-PFN model definitions.
+- `utils.py`: subset extraction, data loading, training, evaluation, plotting,
+  and CLI helpers.
+- `test_demo.py`: fast checks for the data, loss, and cached model path.
 - `make_notebook.py`: local Jupytext wrapper used by CI.
 - `jupytext.toml`: declares the paired `ipynb,py:percent` formats.
 - `.github/workflows/sync-notebook.yml`: regenerates and commits the notebook
   after the Python source is pushed.
 - `requirements.txt`: minimal runtime and notebook dependencies.
+- `zenodo/make_tutorial_subset.py`: deterministic builder for the compact
+  archive from the six full release arrays.
 - `zenodo/DATASET_DESCRIPTION.md`: editable metadata draft for the data record.
 
 ## Data layout
 
-Place the six released NumPy arrays in `data/` (or pass another directory with
-`--data-dir`):
+No data download is required to run the notebook tutorial. On **Run All**, the
+notebook uses the six arrays in `data/` when they are present. When none is
+present, it extracts the bundled `ma_pfn_tutorial.npz` into
+`results_notebook/tutorial_data/` after verifying its SHA-256 checksum.
+
+The compact archive is not synthetic. It selects 448 training, 64 validation,
+and 64 test source events from the full released event-disjoint splits using
+seed 12,345. It retains all unordered pairs among the selected events—100,128,
+2,016, and 2,016 pairs respectively—and copies their exact EMD targets without
+recomputation. Particle features are converted from float64 to float32 only to
+reduce the compressed archive size. The notebook selects exactly 100,000 of
+the available training pairs reproducibly. The selected source-event
+indices, source-array checksums, pair-row hashes, shapes, and target ranges are
+embedded in the archive metadata.
+
+The same archive is included in the Zenodo upload manifest. The loader has a
+checksum-pinned Zenodo file URL as a fallback for distributions that omit the
+bundled copy; that URL becomes public when the currently configured record
+`22099234` is published.
+
+To use the released sample, place its six NumPy arrays in `data/` (or pass
+another directory with `--data-dir` to the command-line workflow):
 
 ```text
 data/
@@ -65,6 +91,10 @@ roughly 24 GB of available host memory, add `--preload` to copy the selected
 training and validation arrays to float32 RAM once; this substantially improves
 random-shuffle throughput on network filesystems.
 
+If only some of the six files exist, the notebook stops before training and
+lists the missing paths. This avoids silently mixing a partial release with the
+tutorial subset.
+
 ## Setup
 
 Python 3.10 or newer is recommended. Create an isolated environment and
@@ -83,10 +113,8 @@ remaining requirements.
 
 ## Run it
 
-A short end-to-end smoke run is:
-
 ```bash
-python ma_pfn_demo.py \
+python run_demo.py \
   --data-dir data \
   --output-dir results \
   --device auto \
@@ -103,7 +131,7 @@ limits and use the defaults of 500 epochs, patience 50, batch size 1,024, Adam
 learning rate `1e-4`, and seed 12,345:
 
 ```bash
-python ma_pfn_demo.py \
+python run_demo.py \
   --data-dir data \
   --output-dir results \
   --device cuda \
@@ -112,17 +140,37 @@ python ma_pfn_demo.py \
 
 The two models train sequentially, making the command work on a one-GPU
 machine. Progress is printed once per epoch. The validation set controls early
-stopping; the test set is first touched by the final benchmark.
+stopping using the hybrid objective; the test set is first touched by the final
+benchmark. The objective, MAPE, and MAE in GeV are all logged separately. The
+loss can be varied explicitly with `--loss`, `--mae-weight`, and `--mae-scale`.
 
 Training and benchmarking can be separated without retraining:
 
 ```bash
-python ma_pfn_demo.py --stage train --data-dir data --output-dir results --device cuda
-python ma_pfn_demo.py --stage benchmark --data-dir data --output-dir results --device cuda
+python run_demo.py --stage train --data-dir data --output-dir results --device cuda
+python run_demo.py --stage benchmark --data-dir data --output-dir results --device cuda
 ```
 
 Architecture dimensions are stored in each checkpoint, so a benchmark-only
 command reconstructs the trained models without repeating those arguments.
+
+Held-out inference defaults to the cached-latent path used by the timing
+benchmarks. Each unique test event is transferred and encoded before pair
+evaluation; pair batches then gather resident latents and run only the
+regression head. MA-PFN uses one shared latent bank. Because the stock PFN
+learns the event-identity tag, it uses separate first-role and second-role
+latent banks. Pass `--no-cache-inference` to reproduce the legacy path that
+rebuilds and re-encodes every tagged pair tensor.
+
+The notebook also contains a small throughput cell comparing resident pair
+encoding with cached inference for identical cross-event pairs. It keeps the
+event tensors and indices on the selected device for both paths, matching the
+timing-study contract. The cell reports cold cached throughput (including
+setup), resident cached throughput, and both speedups for each model in a
+two-panel figure, then writes the complete timings to
+`inference_throughput.json`. This is an
+illustrative sanity check; use the paper's controlled timing suite for reported
+performance numbers.
 
 ## Outputs
 
@@ -135,7 +183,9 @@ results/
 ├── training_curves.png
 ├── accuracy_benchmark.png
 ├── metric_benchmarks.png
+├── inference_throughput.png  # when the notebook timing cell is run
 ├── benchmark_arrays.npz
+├── inference_throughput.json  # when the notebook timing cell is run
 └── summary.json
 ```
 
@@ -155,9 +205,20 @@ tolerance for pass/fail decisions is `1e-3` GeV.
 
 ## Notebook
 
-Open `ma_pfn_demo.ipynb`, edit `notebook_config` in the last cell, and run all
-cells. Its committed defaults are intentionally small. `ma_pfn_demo.py` is the
-source of truth. To regenerate the notebook locally after editing it:
+Open `ma_pfn_demo.ipynb`, edit the `config` cell, and run
+all cells. A clean checkout automatically uses the real-data subset described
+above. Its committed defaults are intentionally small, with release-scale
+values noted next to the settings that differ.
+
+The notebook includes executable, written-out versions of the stock-PFN and
+MA-PFN forward passes, writes out the constructed hybrid-loss equation and
+implementation, and displays the objective/MAPE/MAE learning curves inline.
+It also explicitly encodes unique events, constructs the one-bank MA-PFN and
+two-role PFN caches, gathers pair latents, and times cached inference. Training
+and plotting details remain in helpers so they do not obscure those ideas.
+
+`ma_pfn_demo.py` is the source of truth for the generated notebook. To
+regenerate the notebook locally after editing its source:
 
 ```bash
 python -m pip install jupytext==1.19.5
@@ -165,27 +226,33 @@ python make_notebook.py
 ```
 
 The GitHub Actions workflow runs the same command whenever `ma_pfn_demo.py`,
-the wrapper, or the Jupytext configuration is pushed. If the generated
-notebook changed, the workflow commits it back to the pushed branch as
-`github-actions[bot]`. The workflow requests only `contents: write`; the
-repository must allow GitHub Actions to write to the target branch. Protected
-branches that require pull requests will reject this automatic commit.
+`models.py`, `utils.py`, the wrapper, or the Jupytext configuration is pushed.
+If the generated notebook changed, the workflow commits it back to the pushed
+branch as `github-actions[bot]`. The workflow requests only `contents: write`;
+the repository must allow GitHub Actions to write to the target branch.
+Protected branches that require pull requests will reject this automatic
+commit.
 
 The `.github/workflows` path assumes that the contents of this directory become
 the root of the standalone release repository. GitHub will not discover this
 workflow while `ma-pfn-minimal/` remains nested inside a different repository.
 
-Do not edit generated notebook code directly. Make the change in
-`ma_pfn_demo.py`; Jupytext converts its `# %%` cells to the notebook.
+Do not edit generated notebook code directly. Change the notebook-facing cells
+in `ma_pfn_demo.py`; change models or reusable workflow code in `models.py` or
+`utils.py`.
 
-## Reproducibility and release checklist
+Run the tutorial regression tests with:
 
-- Record SHA-256 checksums for the six arrays in the Zenodo upload.
-- Fill every `[TODO]` field in `zenodo/DATASET_DESCRIPTION.md`, especially the
-  generator settings, EMD convention, authors, licenses, and paper DOI.
-- Add the chosen code license as `LICENSE`. The data license belongs in the
-  Zenodo record and may differ from the code license.
-- Run the smoke command in a fresh environment and archive `summary.json` with
-  the paper's reference outputs.
-- GPU reductions can vary slightly across hardware and PyTorch/CUDA versions;
-  the saved seed and environment metadata make those differences auditable.
+```bash
+python -m unittest -v test_demo.py
+```
+
+To reproduce the compact archive from the full local arrays:
+
+```bash
+python zenodo/make_tutorial_subset.py \
+  --source-dir /path/to/full/release/arrays
+```
+
+The builder is deterministic: the default invocation must produce SHA-256
+`84a0f9c2bb0d1ff793a2ffc2c2e1ee4671d46fe1d61a07f83d93bd0f4bd1b1fb`.

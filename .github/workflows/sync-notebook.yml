@@ -6,6 +6,8 @@ on:
       - "**"
     paths:
       - "ma_pfn_demo.py"
+      - "models.py"
+      - "utils.py"
       - "make_notebook.py"
       - "jupytext.toml"
       - ".github/workflows/sync-notebook.yml"
