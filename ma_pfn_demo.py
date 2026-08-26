@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from torch.nn import functional as F
 
 from models import MAPFN, PFN
@@ -402,14 +403,59 @@ display(cache_summary)
 # more stable measurement.
 
 # %%
-benchmark_inference_throughput(
+throughput = benchmark_inference_throughput(
     config,
     events_per_bank=throughput_events_per_bank,
     repetitions=throughput_repetitions,
+    verbose=False,
 )
+
+labels = [metrics["label"] for metrics in throughput["models"].values()]
+x = np.arange(len(labels))
+width = 0.25
+
+figure, axes = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
+rate_series = (
+    ("Pair encoding", "pair_encoding_resident_pairs_per_second"),
+    ("Cached, cold", "cached_cold_pairs_per_second"),
+    ("Cached, resident", "cached_resident_pairs_per_second"),
+)
+for offset, (label, key) in zip((-width, 0, width), rate_series):
+    values = [metrics[key] for metrics in throughput["models"].values()]
+    axes[0].bar(x + offset, values, width, label=label)
+axes[0].set(
+    xticks=x,
+    xticklabels=labels,
+    ylabel="Pairs / second",
+    title="Inference throughput",
+    yscale="log",
+)
+axes[0].legend(frameon=False, fontsize=8)
+
+speedup_series = (
+    ("Cold", "cached_cold_speedup"),
+    ("Resident", "cached_resident_speedup"),
+)
+for offset, (label, key) in zip((-width / 2, width / 2), speedup_series):
+    values = [metrics[key] for metrics in throughput["models"].values()]
+    bars = axes[1].bar(x + offset, values, width, label=label)
+    axes[1].bar_label(bars, fmt="%.1fx", padding=3, fontsize=8)
+axes[1].axhline(1, color="black", linestyle="--", linewidth=1)
+axes[1].set(
+    xticks=x,
+    xticklabels=labels,
+    ylabel="Speedup over pair encoding",
+    title="Benefit of caching",
+)
+axes[1].legend(frameon=False, fontsize=8)
+
+for axis in axes:
+    axis.grid(axis="y", alpha=0.2)
+figure.savefig(config.output_dir / "inference_throughput.png", dpi=180)
+plt.show()
 
 
 # %% [markdown]
-# The loss plot is shown above. It and the other figures are also saved in
-# `results_notebook/` as `training_curves.png`, `accuracy_benchmark.png`, and
-# `metric_benchmarks.png`.
+# The figures are also saved in `results_notebook/` as `training_curves.png`,
+# `accuracy_benchmark.png`, `metric_benchmarks.png`, and
+# `inference_throughput.png`.

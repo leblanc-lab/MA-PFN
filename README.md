@@ -166,8 +166,9 @@ The notebook also contains a small throughput cell comparing resident pair
 encoding with cached inference for identical cross-event pairs. It keeps the
 event tensors and indices on the selected device for both paths, matching the
 timing-study contract. The cell reports cold cached throughput (including
-setup), resident cached throughput, and both speedups for each model, then
-writes the complete timings to `inference_throughput.json`. This is an
+setup), resident cached throughput, and both speedups for each model in a
+two-panel figure, then writes the complete timings to
+`inference_throughput.json`. This is an
 illustrative sanity check; use the paper's controlled timing suite for reported
 performance numbers.
 
@@ -182,6 +183,7 @@ results/
 ├── training_curves.png
 ├── accuracy_benchmark.png
 ├── metric_benchmarks.png
+├── inference_throughput.png  # when the notebook timing cell is run
 ├── benchmark_arrays.npz
 ├── inference_throughput.json  # when the notebook timing cell is run
 └── summary.json

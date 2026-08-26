@@ -885,6 +885,7 @@ def benchmark_inference_throughput(
     config: WorkflowConfig,
     events_per_bank: int = 64,
     repetitions: int = 3,
+    verbose: bool = True,
 ) -> dict:
     """Compare pair re-encoding with cold and resident-cache inference.
 
@@ -1036,29 +1037,30 @@ def benchmark_inference_throughput(
             "cached_resident_repetition_seconds": cached_times,
         }
 
-    print(
-        f"Inference throughput: {pair_count:,} pairs, batch={config.batch_size:,}, "
-        f"device={device}"
-    )
-    print(
-        f"{'Model':<8} {'pair encode':>13} {'cached cold':>13} "
-        f"{'cached resident':>16} {'encode':>10} {'cold':>8} {'resident':>10}"
-    )
-    print(
-        f"{'':<8} {'(pairs/s)':>13} {'(pairs/s)':>13} "
-        f"{'(pairs/s)':>16} {'(ms)':>10} {'speedup':>8} {'speedup':>10}"
-    )
-    for metrics in output["models"].values():
+    if verbose:
         print(
-            f"{metrics['label']:<8} "
-            f"{metrics['pair_encoding_resident_pairs_per_second']:>10,.0f} p/s "
-            f"{metrics['cached_cold_pairs_per_second']:>10,.0f} p/s "
-            f"{metrics['cached_resident_pairs_per_second']:>13,.0f} p/s "
-            f"{1_000 * metrics['cache_encoding_seconds']:>8.2f} "
-            f"{metrics['cached_cold_speedup']:>7.2f}x "
-            f"{metrics['cached_resident_speedup']:>9.2f}x"
+            f"Inference throughput: {pair_count:,} pairs, "
+            f"batch={config.batch_size:,}, device={device}"
         )
-    print("Cold cached throughput includes one cache setup for this workload.")
+        print(
+            f"{'Model':<8} {'pair encode':>13} {'cached cold':>13} "
+            f"{'cached resident':>16} {'encode':>10} {'cold':>8} {'resident':>10}"
+        )
+        print(
+            f"{'':<8} {'(pairs/s)':>13} {'(pairs/s)':>13} "
+            f"{'(pairs/s)':>16} {'(ms)':>10} {'speedup':>8} {'speedup':>10}"
+        )
+        for metrics in output["models"].values():
+            print(
+                f"{metrics['label']:<8} "
+                f"{metrics['pair_encoding_resident_pairs_per_second']:>10,.0f} p/s "
+                f"{metrics['cached_cold_pairs_per_second']:>10,.0f} p/s "
+                f"{metrics['cached_resident_pairs_per_second']:>13,.0f} p/s "
+                f"{1_000 * metrics['cache_encoding_seconds']:>8.2f} "
+                f"{metrics['cached_cold_speedup']:>7.2f}x "
+                f"{metrics['cached_resident_speedup']:>9.2f}x"
+            )
+        print("Cold cached throughput includes one cache setup for this workload.")
 
     output_path = Path(config.output_dir) / "inference_throughput.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
