@@ -4,13 +4,14 @@ This directory is a self-contained example of the
 metric-aware particle flow network (MA-PFN) used to regress energy mover's
 distance (EMD). It trains MA-PFN and the original unconstrained PFN with the
 same data split and optimizer settings, then compares their held-out accuracy
-and metric properties.
+and metric properties. Both models use the constructed dimensionless objective
+`MAPE + 0.25 * MAE / 90 GeV`, matching the production hybrid-loss controls.
 
 ## Contents
 
 - `ma_pfn_demo.py`: readable notebook source and command-line entry point.
 - `ma_pfn_demo.ipynb`: generated tutorial notebook with a short default run.
-- `ma_pfn_tutorial_subset.npz`: checksum-verified 40 MB subset of the real
+- `ma_pfn_tutorial.npz`: checksum-verified 40 MB subset of the real
   released event pairs and exact EMD targets.
 - `models.py`: side-by-side MA-PFN and stock-PFN model definitions.
 - `utils.py`: subset extraction, data loading, training, evaluation, plotting,
@@ -30,7 +31,7 @@ and metric properties.
 
 No data download is required to run the notebook tutorial. On **Run All**, the
 notebook uses the six arrays in `data/` when they are present. When none is
-present, it extracts the bundled `ma_pfn_tutorial_subset.npz` into
+present, it extracts the bundled `ma_pfn_tutorial.npz` into
 `results_notebook/tutorial_data/` after verifying its SHA-256 checksum.
 
 The compact archive is not synthetic. It selects 448 training, 64 validation,
@@ -139,7 +140,9 @@ python ma_pfn_demo.py \
 
 The two models train sequentially, making the command work on a one-GPU
 machine. Progress is printed once per epoch. The validation set controls early
-stopping; the test set is first touched by the final benchmark.
+stopping using the hybrid objective; the test set is first touched by the final
+benchmark. The objective, MAPE, and MAE in GeV are all logged separately. The
+loss can be varied explicitly with `--loss`, `--mae-weight`, and `--mae-scale`.
 
 Training and benchmarking can be separated without retraining:
 
@@ -207,6 +210,9 @@ values noted next to the settings that differ.
 
 The notebook includes executable, written-out versions of the stock-PFN and
 MA-PFN forward passes and verifies them against the reusable model classes. It
+also writes out the constructed hybrid-loss equation and implementation,
+checks it against the exact loss class used for training, and displays the
+objective/MAPE/MAE learning curves inline. It
 also explicitly encodes unique events, constructs the one-bank MA-PFN and
 two-role PFN caches, gathers pair latents, and checks cached predictions against
 ordinary pair encoding before timing both paths. Training-loop and plotting

@@ -7,15 +7,68 @@ from torch import nn
 import torch.nn.functional as F
 
 
-class MAPELoss(nn.Module):
-    """Mean absolute percentage error used for both models."""
+class HybridEMDLoss(nn.Module):
+    """MAPE, MAE, or MAPE plus a dimensionless normalized-MAE term.
 
-    def __init__(self, eps: float = 1e-8) -> None:
+    This is the loss used by the full training workflow. Keeping its
+    components available lets the tutorial optimize the hybrid objective while
+    reporting the two physically interpretable error measures separately.
+    """
+
+    def __init__(
+        self,
+        mae_weight: float = 0.0,
+        mae_scale: float = 90.0,
+        eps: float = 1e-8,
+        loss: str = "hybrid",
+    ) -> None:
         super().__init__()
+        if loss not in {"mape", "mae", "hybrid"}:
+            raise ValueError("loss must be mape, mae, or hybrid")
+        if mae_weight < 0:
+            raise ValueError("mae_weight must be non-negative")
+        if mae_scale <= 0:
+            raise ValueError("mae_scale must be positive")
+        self.loss = loss
+        self.mae_weight = mae_weight
+        self.mae_scale = mae_scale
         self.eps = eps
 
+    @property
+    def description(self) -> str:
+        if self.loss == "mape":
+            return "MAPE"
+        if self.loss == "mae":
+            return "MAE"
+        return f"MAPE + {self.mae_weight:g} * MAE / {self.mae_scale:g} GeV"
+
+    def objective_from_metrics(
+        self, mape: torch.Tensor | float, mae: torch.Tensor | float
+    ) -> torch.Tensor | float:
+        if self.loss == "mape":
+            return mape
+        if self.loss == "mae":
+            return mae
+        return mape + self.mae_weight * mae / self.mae_scale
+
+    def components(
+        self, prediction: torch.Tensor, target: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        absolute_error = torch.abs(target - prediction)
+        mape = torch.mean(absolute_error / (target.abs() + self.eps))
+        mae = torch.mean(absolute_error)
+        objective = self.objective_from_metrics(mape, mae)
+        return objective, mape, mae
+
     def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return torch.mean(torch.abs((target - prediction) / (target + self.eps)))
+        return self.components(prediction, target)[0]
+
+
+class MAPELoss(HybridEMDLoss):
+    """Backward-compatible pure-MAPE specialization."""
+
+    def __init__(self, eps: float = 1e-8) -> None:
+        super().__init__(eps=eps, loss="mape")
 
 
 class ParticleLevelLinear(nn.Module):
@@ -164,4 +217,10 @@ class PFN(nn.Module):
         return self._head(latent)
 
 
-__all__ = ["MAPELoss", "MAPFN", "PFN", "ParticleLevelLinear"]
+__all__ = [
+    "HybridEMDLoss",
+    "MAPELoss",
+    "MAPFN",
+    "PFN",
+    "ParticleLevelLinear",
+]

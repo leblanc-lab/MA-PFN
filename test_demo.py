@@ -13,13 +13,17 @@ import torch
 
 from ma_pfn_demo import (
     cache_events_explicitly,
+    hybrid_emd_loss_written_out,
     metric_aware_forward,
     score_cached_pairs_explicitly,
     stock_pfn_forward,
 )
-from models import MAPFN, PFN
+from models import HybridEMDLoss, MAPFN, PFN
 from utils import (
+    TUTORIAL_SUBSET_FILENAME,
     TUTORIAL_SUBSET_SHA256,
+    TUTORIAL_SUBSET_URL,
+    WorkflowConfig,
     predict_event_pairs,
     prepare_demo_data,
     reconstruct_split_events,
@@ -31,8 +35,12 @@ ROOT = Path(__file__).resolve().parent
 
 
 class TutorialDataTests(unittest.TestCase):
+    def test_bundled_and_zenodo_filenames_match(self) -> None:
+        self.assertEqual(TUTORIAL_SUBSET_FILENAME, "ma_pfn_tutorial.npz")
+        self.assertIn("/files/ma_pfn_tutorial.npz?download=1", TUTORIAL_SUBSET_URL)
+
     def test_bundled_archive_checksum_and_provenance(self) -> None:
-        archive_path = ROOT / "ma_pfn_tutorial_subset.npz"
+        archive_path = ROOT / "ma_pfn_tutorial.npz"
         self.assertEqual(
             hashlib.sha256(archive_path.read_bytes()).hexdigest(),
             TUTORIAL_SUBSET_SHA256,
@@ -108,6 +116,30 @@ class VisibleImplementationTests(unittest.TestCase):
         with torch.inference_mode():
             for model, written_out in cases:
                 torch.testing.assert_close(model(pairs), written_out(model, pairs))
+
+    def test_written_out_hybrid_loss_matches_training_implementation(self) -> None:
+        config = WorkflowConfig()
+        self.assertEqual(config.loss, "hybrid")
+        self.assertEqual(config.mae_weight, 0.25)
+        self.assertEqual(config.mae_scale, 90.0)
+
+        prediction = torch.tensor([8.0, 24.0])
+        target = torch.tensor([10.0, 20.0])
+        expected = hybrid_emd_loss_written_out(
+            prediction,
+            target,
+            config.mae_weight,
+            config.mae_scale,
+        )
+        actual = HybridEMDLoss(
+            mae_weight=config.mae_weight,
+            mae_scale=config.mae_scale,
+        ).components(prediction, target)
+        for expected_component, actual_component in zip(expected, actual):
+            torch.testing.assert_close(expected_component, actual_component)
+        torch.testing.assert_close(actual[1], torch.tensor(0.2))
+        torch.testing.assert_close(actual[2], torch.tensor(3.0))
+        torch.testing.assert_close(actual[0], torch.tensor(0.20833333))
 
     def test_explicit_cache_matches_ordinary_pair_encoding(self) -> None:
         events = reconstruct_split_events(self.data_dir)

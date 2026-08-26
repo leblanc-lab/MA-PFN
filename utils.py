@@ -19,13 +19,13 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from models import MAPELoss, MAPFN, PFN
+from models import HybridEMDLoss, MAPFN, PFN
 
 
 MODEL_LABELS = {"ma_pfn": "MA-PFN", "pfn": "PFN"}
 MODEL_COLORS = {"ma_pfn": "#0072B2", "pfn": "#D55E00"}
 DATA_SPLITS = ("train", "val", "test")
-TUTORIAL_SUBSET_FILENAME = "ma_pfn_tutorial_subset.npz"
+TUTORIAL_SUBSET_FILENAME = "ma_pfn_tutorial.npz"
 TUTORIAL_SUBSET_SHA256 = (
     "84a0f9c2bb0d1ff793a2ffc2c2e1ee4671d46fe1d61a07f83d93bd0f4bd1b1fb"
 )
@@ -46,6 +46,9 @@ class WorkflowConfig:
     patience: int = 50
     batch_size: int = 1024
     learning_rate: float = 1e-4
+    loss: str = "hybrid"
+    mae_weight: float = 0.25
+    mae_scale: float = 90.0
     num_workers: int = 0
     seed: int = 12345
     latent_dim: int = 64
@@ -152,23 +155,24 @@ def select_device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
-def evaluate_loss(
+def evaluate_loss_components(
     model: nn.Module,
     loader: DataLoader,
-    loss_fn: nn.Module,
+    loss_fn: HybridEMDLoss,
     device: torch.device,
-) -> float:
+) -> dict[str, float]:
     model.eval()
-    total = 0.0
+    totals = {"objective": 0.0, "mape": 0.0, "mae": 0.0}
     examples = 0
     with torch.inference_mode():
         for features, target in loader:
             features = features.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
-            loss = loss_fn(model(features), target)
-            total += loss.item() * len(features)
+            components = loss_fn.components(model(features), target)
+            for key, value in zip(totals, components):
+                totals[key] += value.item() * len(features)
             examples += len(features)
-    return total / examples
+    return {key: total / examples for key, total in totals.items()}
 
 
 def train_one_model(
@@ -181,7 +185,11 @@ def train_one_model(
     set_seed(config.seed)
     model = make_model(name, config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-    loss_fn = MAPELoss()
+    loss_fn = HybridEMDLoss(
+        mae_weight=config.mae_weight,
+        mae_scale=config.mae_scale,
+        loss=config.loss,
+    )
 
     loader_options = {
         "batch_size": config.batch_size,
@@ -203,36 +211,55 @@ def train_one_model(
         f"Training {MODEL_LABELS[name]} ({parameter_count:,} parameters) on {device}",
         flush=True,
     )
+    print(f"  objective: {loss_fn.description}", flush=True)
 
-    history = {"train_mape": [], "val_mape": []}
+    history: dict[str, object] = {
+        "train_objective": [],
+        "train_mape": [],
+        "train_mae": [],
+        "val_objective": [],
+        "val_mape": [],
+        "val_mae": [],
+    }
     best_loss = float("inf")
     best_epoch = -1
+    best_metrics: dict[str, float] = {}
     started = time.time()
     for epoch in range(config.epochs):
         model.train()
-        total = 0.0
+        totals = {"objective": 0.0, "mape": 0.0, "mae": 0.0}
         examples = 0
         for features, target in train_loader:
             features = features.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            loss = loss_fn(model(features), target)
-            loss.backward()
+            components = loss_fn.components(model(features), target)
+            objective = components[0]
+            objective.backward()
             optimizer.step()
-            total += loss.item() * len(features)
+            for key, value in zip(totals, components):
+                totals[key] += value.item() * len(features)
             examples += len(features)
 
-        train_loss = total / examples
-        val_loss = evaluate_loss(model, val_loader, loss_fn, device)
-        history["train_mape"].append(train_loss)
-        history["val_mape"].append(val_loss)
-        improved = val_loss < best_loss
+        train_metrics = {key: total / examples for key, total in totals.items()}
+        val_metrics = evaluate_loss_components(model, val_loader, loss_fn, device)
+        for key in totals:
+            history[f"train_{key}"].append(train_metrics[key])
+            history[f"val_{key}"].append(val_metrics[key])
+        improved = val_metrics["objective"] < best_loss
         if improved:
-            best_loss = val_loss
+            best_loss = val_metrics["objective"]
             best_epoch = epoch
+            best_metrics = val_metrics.copy()
             checkpoint = {
                 "format_version": 1,
                 "architecture": name,
+                "loss": {
+                    "name": config.loss,
+                    "mae_weight": config.mae_weight,
+                    "mae_scale_gev": config.mae_scale,
+                    "description": loss_fn.description,
+                },
                 "model_kwargs": {
                     "input_dim": 4,
                     "latent_dim": config.latent_dim,
@@ -247,7 +274,11 @@ def train_one_model(
         marker = " *" if improved else ""
         print(
             f"  epoch {epoch + 1:03d}/{config.epochs}: "
-            f"train={train_loss:.6f}, val={val_loss:.6f}, {elapsed:.1f} min{marker}",
+            f"train objective={train_metrics['objective']:.6f}, "
+            f"val objective={val_metrics['objective']:.6f}, "
+            f"val MAPE={val_metrics['mape']:.6f}, "
+            f"val MAE={val_metrics['mae']:.4f} GeV, "
+            f"{elapsed:.1f} min{marker}",
             flush=True,
         )
         if config.patience and epoch - best_epoch >= config.patience:
@@ -258,9 +289,15 @@ def train_one_model(
         {
             "model": name,
             "parameter_count": parameter_count,
-            "epochs_completed": len(history["train_mape"]),
+            "loss": config.loss,
+            "objective_description": loss_fn.description,
+            "mae_weight": config.mae_weight,
+            "mae_scale_gev": config.mae_scale,
+            "epochs_completed": len(history["train_objective"]),
             "best_epoch": best_epoch + 1,
-            "best_val_mape": best_loss,
+            "best_val_objective": best_metrics["objective"],
+            "best_val_mape": best_metrics["mape"],
+            "best_val_mae": best_metrics["mae"],
         }
     )
     (run_dir / "history.json").write_text(json.dumps(history, indent=2) + "\n")
@@ -1032,30 +1069,35 @@ def benchmark_inference_throughput(
 def plot_training(histories: dict[str, dict], output_dir: Path) -> None:
     import matplotlib.pyplot as plt
 
-    figure, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+    figure, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
+    panels = (
+        ("objective", "Hybrid objective"),
+        ("mape", "MAPE"),
+        ("mae", "MAE [GeV]"),
+    )
     for name, history in histories.items():
-        epochs = np.arange(1, len(history["train_mape"]) + 1)
+        epochs = np.arange(1, len(history["train_objective"]) + 1)
         color = MODEL_COLORS[name]
-        axes[0].plot(
-            epochs,
-            history["train_mape"],
-            color=color,
-            marker="o",
-            markersize=3,
-            label=MODEL_LABELS[name],
-        )
-        axes[1].plot(
-            epochs,
-            history["val_mape"],
-            color=color,
-            marker="o",
-            markersize=3,
-            label=MODEL_LABELS[name],
-        )
-    for axis, title in zip(axes, ("Training", "Validation")):
-        axis.set(xlabel="Epoch", ylabel="MAPE", title=title)
+        for axis, (key, ylabel) in zip(axes, panels):
+            axis.plot(
+                epochs,
+                history[f"train_{key}"],
+                color=color,
+                linestyle=":",
+                label=f"{MODEL_LABELS[name]} train",
+            )
+            axis.plot(
+                epochs,
+                history[f"val_{key}"],
+                color=color,
+                marker="o",
+                markersize=3,
+                label=f"{MODEL_LABELS[name]} validation",
+            )
+            axis.set(xlabel="Epoch", ylabel=ylabel)
+    for axis in axes:
         axis.grid(alpha=0.2)
-        axis.legend(frameon=False)
+        axis.legend(frameon=False, fontsize=8)
     figure.savefig(output_dir / "training_curves.png", dpi=180)
     plt.close(figure)
 
@@ -1198,6 +1240,10 @@ def validate_config(config: WorkflowConfig) -> None:
         raise ValueError("stage must be all, train, or benchmark")
     if config.epochs <= 0 or config.batch_size <= 0:
         raise ValueError("epochs and batch_size must be positive")
+    if config.loss not in {"mape", "mae", "hybrid"}:
+        raise ValueError("loss must be mape, mae, or hybrid")
+    if config.mae_weight < 0 or config.mae_scale <= 0:
+        raise ValueError("mae_weight must be non-negative and mae_scale positive")
     if config.metric_samples <= 0 or config.tolerance < 0:
         raise ValueError("metric_samples must be positive and tolerance non-negative")
     if config.cpu_threads is not None and config.cpu_threads <= 0:
@@ -1288,6 +1334,16 @@ def parse_args() -> WorkflowConfig:
     )
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--loss", choices=("mape", "mae", "hybrid"), default="hybrid"
+    )
+    parser.add_argument("--mae-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--mae-scale",
+        type=float,
+        default=90.0,
+        help="GeV scale that makes the hybrid loss's MAE term dimensionless",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--latent-dim", type=int, default=64)

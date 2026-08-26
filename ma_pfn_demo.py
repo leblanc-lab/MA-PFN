@@ -37,7 +37,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from models import MAPFN, PFN
+from models import HybridEMDLoss, MAPFN, PFN
 from utils import (
     WorkflowConfig,
     benchmark_inference_throughput,
@@ -51,7 +51,7 @@ from utils import (
 )
 
 if "get_ipython" in globals():
-    from IPython.display import display
+    from IPython.display import Image as NotebookImage, display
 
 
 # %% [markdown]
@@ -97,6 +97,9 @@ config = WorkflowConfig(
     patience=0,  # release scale: 50; 0 disables early stopping
     batch_size=1_024,
     learning_rate=1e-3,  # release scale: 1e-4
+    loss="hybrid",
+    mae_weight=0.25,  # matched production setting
+    mae_scale=90.0,  # GeV; makes the MAE contribution dimensionless
     num_workers=0,
     preload=False,  # True is faster if the selected arrays fit in host RAM
 
@@ -121,7 +124,7 @@ results = None  # dependent cells skip cleanly if preparation or training fails
 # ## Find the full data—or extract its tutorial subset
 #
 # If all six release arrays exist in `data/`, the notebook uses them.
-# Otherwise, it extracts `ma_pfn_tutorial_subset.npz` under
+# Otherwise, it extracts `ma_pfn_tutorial.npz` under
 # `results_notebook/tutorial_data/`. The archive selects 448/64/64 real
 # source events from the released event-disjoint train/validation/test splits,
 # retains every unordered pair among them, and copies the corresponding exact
@@ -247,6 +250,79 @@ if "get_ipython" in globals() and data_info is not None:
 
 
 # %% [markdown]
+# ## The constructed training loss, in code
+#
+# Pure MAPE treats a fixed error as increasingly important as the target gets
+# smaller; pure MAE instead emphasizes large absolute misses. The constructed
+# loss retains both signals:
+#
+# $$
+# \mathcal{L}_{\mathrm{hybrid}}
+# = \operatorname{MAPE}
+# + \lambda\,\frac{\operatorname{MAE}}{s},
+# \qquad
+# \operatorname{MAPE}=\frac{1}{n}\sum_i
+# \frac{|y_i-\hat y_i|}{|y_i|+\epsilon}.
+# $$
+#
+# Dividing MAE by the fixed energy scale $s$ makes that term dimensionless.
+# The tutorial uses the matched production values $\lambda=0.25$ and
+# $s=90\ \mathrm{GeV}$. Training, checkpoint selection, and early stopping use
+# the combined objective, while MAPE and MAE remain visible diagnostics.
+
+# %%
+def hybrid_emd_loss_written_out(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mae_weight: float,
+    mae_scale: float,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (hybrid objective, MAPE, MAE) using the displayed equation."""
+
+    absolute_error = torch.abs(target - prediction)
+    mape = torch.mean(absolute_error / (target.abs() + eps))
+    mae = torch.mean(absolute_error)
+    objective = mape + mae_weight * mae / mae_scale
+    return objective, mape, mae
+
+
+# %%
+if "get_ipython" in globals() and data_info is not None:
+    sample_target = torch.from_numpy(
+        np.array(
+            np.load(config.data_dir / "train_targets.npy", mmap_mode="r")[:4],
+            dtype=np.float32,
+        )
+    )
+    sample_prediction = sample_target * torch.tensor([0.8, 1.2, 0.9, 1.1])
+    written_out = hybrid_emd_loss_written_out(
+        sample_prediction,
+        sample_target,
+        config.mae_weight,
+        config.mae_scale,
+    )
+    reusable_loss = HybridEMDLoss(
+        mae_weight=config.mae_weight,
+        mae_scale=config.mae_scale,
+        loss="hybrid",
+    )
+    reusable = reusable_loss.components(sample_prediction, sample_target)
+    for expected, actual in zip(written_out, reusable):
+        torch.testing.assert_close(expected, actual)
+    display({
+        "objective_used_for_training": reusable_loss.description,
+        "example_hybrid_objective": float(reusable[0]),
+        "example_mape": float(reusable[1]),
+        "example_mae_gev": float(reusable[2]),
+        "max_abs_written_out_vs_class": max(
+            float(torch.abs(expected - actual))
+            for expected, actual in zip(written_out, reusable)
+        ),
+    })
+
+
+# %% [markdown]
 # ## Cached inference
 #
 # A data set with `N` unique events contains up to `N(N-1)/2` pairs. Re-running
@@ -272,9 +348,10 @@ if "get_ipython" in globals() and data_info is not None:
 # %% [markdown]
 # ## Train, benchmark, and plot
 #
-# The workflow trains both models, saves their best checkpoints, evaluates the
-# held-out test pairs, runs the metric-property benchmarks, and writes three
-# plots plus machine-readable JSON/NPZ results.
+# The workflow trains both models with the displayed hybrid loss, selects their
+# best checkpoints by validation hybrid objective, evaluates the held-out test
+# pairs, runs the metric-property benchmarks, and writes three plots plus
+# machine-readable JSON/NPZ results.
 
 # %%
 if "get_ipython" in globals() and data_info is not None:
@@ -284,11 +361,28 @@ if "get_ipython" in globals() and data_info is not None:
 # %%
 if "get_ipython" in globals() and results is not None:
     display({
+        "loss": {
+            "name": config.loss,
+            "mae_weight": config.mae_weight,
+            "mae_scale_gev": config.mae_scale,
+        },
+        "training_at_selected_checkpoint": {
+            name: {
+                "epoch": history["best_epoch"],
+                "validation_objective": history["best_val_objective"],
+                "validation_mape": history["best_val_mape"],
+                "validation_mae_gev": history["best_val_mae"],
+            }
+            for name, history in results["training"].items()
+        },
         "inference_mode": results["benchmark"]["inference_mode"],
         "data_kind": data_info["kind"],
         "accuracy": results["accuracy"],
         "metric_properties": results["metric_properties"],
     })
+    training_plot = config.output_dir / "training_curves.png"
+    if training_plot.is_file():
+        display(NotebookImage(filename=str(training_plot)))
 
 
 # %% [markdown]
@@ -389,8 +483,9 @@ if "get_ipython" in globals() and results is not None:
 
 
 # %% [markdown]
-# The plots are saved in `results_notebook/` as `training_curves.png`,
-# `accuracy_benchmark.png`, and `metric_benchmarks.png`.
+# The loss plot is shown above. It and the other figures are also saved in
+# `results_notebook/` as `training_curves.png`, `accuracy_benchmark.png`, and
+# `metric_benchmarks.png`.
 
 
 # %%
