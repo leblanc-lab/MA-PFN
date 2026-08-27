@@ -94,6 +94,9 @@ class MAPFN(nn.Module):
     Averaging those two evaluations makes exchange symmetry exact without
     discarding sign information.  The mean absolute latent separation gives
     exact zero self-distance, and softplus makes predictions non-negative.
+
+    Triangle inequality is evaluated empirically rather than enforced by this
+    architecture.
     """
 
     def __init__(

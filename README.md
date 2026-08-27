@@ -16,6 +16,14 @@ head output. This gives non-negativity, zero self-distance, and exchange
 symmetry by construction. At these dimensions, MA-PFN has **50,265** trainable
 parameters and the matched stock PFN has **43,865**.
 
+The selected production run used seed 23,411, AdamW with learning rate `1e-4`
+and zero weight decay, batch size 1,024, and at most 700 epochs with patience
+50. It early-stopped after epoch 698, and epoch 648 was selected by validation
+hybrid objective. The tutorial reproduces the architecture and training
+configuration; it does not bundle that trained production checkpoint. The
+selected checkpoint's SHA-256 is
+`05a16361bbc8a8c0c137f530f1fac3c7d9990d2145fdb62e54c2f0b422d5551d`.
+
 ## Contents
 
 - `ma_pfn_demo.py`: readable Jupytext source for the notebook.
@@ -154,6 +162,13 @@ stopping using the hybrid objective; the test set is first touched by the final
 benchmark. The objective, MAPE, and MAE in GeV are all logged separately. The
 loss can be varied explicitly with `--loss`, `--mae-weight`, and `--mae-scale`;
 optimizer weight decay can be varied with `--weight-decay`.
+
+The command-line defaults of 100,000 held-out pairs and 20,000 metric samples
+are deliberately smaller evaluation workloads for this minimal example. They
+must not be reported as reproducing the paper's all-798,216-pair response study
+or its one-million-triplet metric-property study. To request those paper-scale
+sample counts from checkpoints trained by this workflow, pass
+`--max-test-pairs 0 --metric-samples 1000000`.
 
 Training and benchmarking can be separated without retraining:
 
