@@ -7,6 +7,15 @@ same data split and optimizer settings, then compares their held-out accuracy
 and metric properties. Both models use the constructed dimensionless objective
 `MAPE + 0.25 * MAE / 90 GeV`, matching the production hybrid-loss controls.
 
+This example implements the selected symmetric joint-head MA-PFN. Its shared
+encoder maps `4 -> 100 -> 100 -> 64`. A `128 -> 100 -> 100 -> 100 -> 1` head
+receives the pooled latent sum and signed difference, is evaluated at both
+event orientations, and has its two outputs averaged. The prediction is the
+mean absolute latent separation multiplied by the softplus of that symmetric
+head output. This gives non-negativity, zero self-distance, and exchange
+symmetry by construction. At these dimensions, MA-PFN has **50,265** trainable
+parameters and the matched stock PFN has **43,865**.
+
 ## Contents
 
 - `ma_pfn_demo.py`: readable Jupytext source for the notebook.
@@ -17,7 +26,8 @@ and metric properties. Both models use the constructed dimensionless objective
 - `models.py`: side-by-side MA-PFN and stock-PFN model definitions.
 - `utils.py`: subset extraction, data loading, training, evaluation, plotting,
   and CLI helpers.
-- `test_demo.py`: fast checks for the data, loss, and cached model path.
+- `test_demo.py`: fast checks for data, loss, parameter counts, structural
+  properties, and the cached model path.
 - `make_notebook.py`: local Jupytext wrapper used by CI.
 - `jupytext.toml`: declares the paired `ipynb,py:percent` formats.
 - `.github/workflows/sync-notebook.yml`: regenerates and commits the notebook
@@ -126,9 +136,9 @@ python run_demo.py \
   --metric-samples 1000
 ```
 
-For the release-scale configuration, omit the training and validation pair
-limits and use the defaults of 500 epochs, patience 50, batch size 1,024, Adam
-learning rate `1e-4`, and seed 12,345:
+For the production training configuration, omit the training and validation
+pair limits. The defaults are 700 epochs, patience 50, batch size 1,024, AdamW
+with learning rate `1e-4` and zero weight decay, and seed 23,411:
 
 ```bash
 python run_demo.py \
@@ -142,7 +152,8 @@ The two models train sequentially, making the command work on a one-GPU
 machine. Progress is printed once per epoch. The validation set controls early
 stopping using the hybrid objective; the test set is first touched by the final
 benchmark. The objective, MAPE, and MAE in GeV are all logged separately. The
-loss can be varied explicitly with `--loss`, `--mae-weight`, and `--mae-scale`.
+loss can be varied explicitly with `--loss`, `--mae-weight`, and `--mae-scale`;
+optimizer weight decay can be varied with `--weight-decay`.
 
 Training and benchmarking can be separated without retraining:
 
@@ -151,8 +162,9 @@ python run_demo.py --stage train --data-dir data --output-dir results --device c
 python run_demo.py --stage benchmark --data-dir data --output-dir results --device cuda
 ```
 
-Architecture dimensions are stored in each checkpoint, so a benchmark-only
-command reconstructs the trained models without repeating those arguments.
+Architecture dimensions and the explicit `joint` or `baseline` architecture
+identifier are stored in each checkpoint, so a benchmark-only command
+reconstructs the trained models without repeating those arguments.
 
 Held-out inference defaults to the cached-latent path used by the timing
 benchmarks. Each unique test event is transferred and encoded before pair

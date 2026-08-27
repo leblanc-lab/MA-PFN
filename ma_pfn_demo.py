@@ -60,9 +60,10 @@ from IPython.display import Image as NotebookImage, display
 # and applies an unconstrained regression head. MA-PFN makes four changes:
 #
 # 1. the `-1`/`+1` tag selects a pool but is zeroed before particle encoding;
-# 2. the two event latents are combined only as `abs(A - B)` and `A + B`;
-# 3. the difference branch has no biases, so identical inputs stay zero; and
-# 4. the final product is absolute-valued.
+# 2. one joint head receives the latent sum and the *signed* difference;
+# 3. the head is evaluated in both event orientations and those outputs are
+#    averaged; and
+# 4. a softplus scale is multiplied by the mean absolute latent separation.
 #
 # Together these changes enforce non-negativity, identity, and symmetry by
 # construction.
@@ -81,7 +82,7 @@ config = WorkflowConfig(
     output_dir=Path("results_notebook"),
     device="auto",  # automatically use CUDA when available
     cpu_threads=4,  # avoids thread-launch overhead for this small CPU workload
-    seed=12_345,
+    seed=23_411,    # selected production run
 
     # Architecture (shared wherever possible for a controlled comparison)
     latent_dim=64,  # release scale: 64
@@ -89,22 +90,23 @@ config = WorkflowConfig(
     f_hidden_dim=100,  # release scale: 100
 
     # Optimization
-    epochs=10,  # release scale: 500
-    patience=0,  # release scale: 50; 0 disables early stopping
+    epochs=10,           # release scale: 700
+    patience=0,          # release scale: 50; 0 disables early stopping
     batch_size=1_024,
     learning_rate=1e-3,  # release scale: 1e-4
+    weight_decay=0.0,    # matched production setting
     loss="hybrid",
-    mae_weight=0.25,  # matched production setting
-    mae_scale=90.0,  # GeV; makes the MAE contribution dimensionless
+    mae_weight=0.25,     # matched production setting
+    mae_scale=90.0,      # GeV; makes the MAE contribution dimensionless
     num_workers=0,
-    preload=False,  # True is faster if the selected arrays fit in host RAM
+    preload=False,       # True is faster if the selected arrays fit in host RAM
 
     # Reproducible demo subsets and final benchmarks
     max_train_pairs=100_000,
     max_val_pairs=None,
-    max_test_pairs=None,  # release scale: 100_000
-    metric_samples=1_024,  # release scale: 20_000
-    tolerance=1e-3,  # GeV; pass/fail tolerance for metric properties
+    max_test_pairs=None,   # paper benchmark: all 798,216 held-out pairs
+    metric_samples=1_024,  # paper metric-property study: 1,000,000
+    tolerance=1e-3,        # GeV; pass/fail tolerance for metric properties
     cache_inference=True,  # reuse event embeddings, as in the timing benchmark
     make_plots=True,
 )
@@ -191,17 +193,24 @@ def metric_aware_forward(model: MAPFN, tagged_pairs: torch.Tensor) -> torch.Tens
     first = (phi * (event_id == -1)).sum(dim=1)
     second = (phi * (event_id == 1)).sum(dim=1)
 
-    difference = torch.abs(first - second)  # unchanged by swapping the events
-    total = first + second                  # unchanged by swapping the events
-    difference = F.relu(model.f_diff1(difference))  # all f_diff layers are bias-free
-    difference = F.relu(model.f_diff2(difference))
-    difference = F.relu(model.f_diff3(difference))
-    difference = model.f_diff4(difference)
-    total = F.relu(model.f_sum1(total))
-    total = F.relu(model.f_sum2(total))
-    total = F.relu(model.f_sum3(total))
-    total = model.f_sum4(total)
-    prediction = torch.abs(difference * total)[:, 0]  # non-negative
+    latent_sum = first + second
+    latent_difference = first - second
+
+    def joint_log_scale(difference: torch.Tensor) -> torch.Tensor:
+        features = torch.cat((latent_sum, difference), dim=1)
+        features = F.relu(model.f_joint1(features))
+        features = F.relu(model.f_joint2(features))
+        features = F.relu(model.f_joint3(features))
+        return model.f_joint4(features)[:, 0]
+
+    # Swapping the events negates only the signed difference. Averaging the two
+    # orientations therefore makes the learned scale exactly symmetric.
+    symmetric_log_scale = 0.5 * (
+        joint_log_scale(latent_difference)
+        + joint_log_scale(-latent_difference)
+    )
+    latent_separation = torch.mean(torch.abs(latent_difference), dim=1)
+    prediction = latent_separation * F.softplus(symmetric_log_scale)
 
     identical = torch.isclose(first, second, rtol=1e-5, atol=1e-6).all(dim=1)
     return torch.where(identical, torch.zeros_like(prediction), prediction)
