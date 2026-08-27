@@ -64,13 +64,6 @@ from IPython.display import Image as NotebookImage, display
 # 3. the head is evaluated in both event orientations and those outputs are
 #    averaged; and
 # 4. a softplus scale is multiplied by the mean absolute latent separation.
-#
-# Together these changes enforce non-negativity, identity, and symmetry by
-# construction. At the release dimensions below, MA-PFN has 50,265 trainable
-# parameters and the matched stock PFN has 43,865. The selected production
-# checkpoint is epoch 648 of the extended run (698 epochs completed) and has
-# SHA-256 `05a16361bbc8a8c0c137f530f1fac3c7d9990d2145fdb62e54c2f0b422d5551d`;
-# the trained weights are not bundled with this tutorial.
 
 # %% [markdown]
 # ## Configure the demonstration

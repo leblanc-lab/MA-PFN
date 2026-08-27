@@ -16,14 +16,6 @@ head output. This gives non-negativity, zero self-distance, and exchange
 symmetry by construction. At these dimensions, MA-PFN has **50,265** trainable
 parameters and the matched stock PFN has **43,865**.
 
-The selected production run used seed 23,411, AdamW with learning rate `1e-4`
-and zero weight decay, batch size 1,024, and at most 700 epochs with patience
-50. It early-stopped after epoch 698, and epoch 648 was selected by validation
-hybrid objective. The tutorial reproduces the architecture and training
-configuration; it does not bundle that trained production checkpoint. The
-selected checkpoint's SHA-256 is
-`05a16361bbc8a8c0c137f530f1fac3c7d9990d2145fdb62e54c2f0b422d5551d`.
-
 ## Contents
 
 - `ma_pfn_demo.py`: readable Jupytext source for the notebook.
@@ -51,21 +43,6 @@ No data download is required to run the notebook tutorial. On **Run All**, the
 notebook uses the six arrays in `data/` when they are present. When none is
 present, it extracts the bundled `ma_pfn_tutorial.npz` into
 `results_notebook/tutorial_data/` after verifying its SHA-256 checksum.
-
-The compact archive is not synthetic. It selects 448 training, 64 validation,
-and 64 test source events from the full released event-disjoint splits using
-seed 12,345. It retains all unordered pairs among the selected events—100,128,
-2,016, and 2,016 pairs respectively—and copies their exact EMD targets without
-recomputation. Particle features are converted from float64 to float32 only to
-reduce the compressed archive size. The notebook selects exactly 100,000 of
-the available training pairs reproducibly. The selected source-event
-indices, source-array checksums, pair-row hashes, shapes, and target ranges are
-embedded in the archive metadata.
-
-The same archive is included in the Zenodo upload manifest. The loader has a
-checksum-pinned Zenodo file URL as a fallback for distributions that omit the
-bundled copy; that URL becomes public when the currently configured record
-`22099234` is published.
 
 To use the released sample, place its six NumPy arrays in `data/` (or pass
 another directory with `--data-dir` to the command-line workflow):
