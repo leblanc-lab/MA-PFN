@@ -17,6 +17,7 @@ from utils import (
     TUTORIAL_SUBSET_SHA256,
     TUTORIAL_SUBSET_URL,
     WorkflowConfig,
+    load_checkpoint,
     predict_event_pairs,
     prepare_demo_data,
     reconstruct_split_events,
@@ -104,6 +105,12 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(config.loss, "hybrid")
         self.assertEqual(config.mae_weight, 0.25)
         self.assertEqual(config.mae_scale, 90.0)
+        self.assertEqual(config.epochs, 700)
+        self.assertEqual(config.patience, 50)
+        self.assertEqual(config.batch_size, 1024)
+        self.assertEqual(config.learning_rate, 1e-4)
+        self.assertEqual(config.weight_decay, 0.0)
+        self.assertEqual(config.seed, 23411)
 
         prediction = torch.tensor([8.0, 24.0])
         target = torch.tensor([10.0, 20.0])
@@ -114,6 +121,82 @@ class ModelTests(unittest.TestCase):
         torch.testing.assert_close(mape, torch.tensor(0.2))
         torch.testing.assert_close(mae, torch.tensor(3.0))
         torch.testing.assert_close(objective, torch.tensor(0.20833333))
+
+    def test_release_parameter_counts(self) -> None:
+        kwargs = {
+            "input_dim": 4,
+            "latent_dim": 64,
+            "phi_hidden_dim": 100,
+            "f_hidden_dim": 100,
+        }
+        ma_pfn_parameters = sum(
+            parameter.numel() for parameter in MAPFN(**kwargs).parameters()
+        )
+        pfn_parameters = sum(
+            parameter.numel() for parameter in PFN(**kwargs).parameters()
+        )
+        self.assertEqual(ma_pfn_parameters, 50_265)
+        self.assertEqual(pfn_parameters, 43_865)
+
+    def test_ma_pfn_structural_properties(self) -> None:
+        torch.manual_seed(23411)
+        model = MAPFN(4, 5, 7, 9).eval()
+        first = torch.randn(16, 5)
+        second = torch.randn(16, 5)
+
+        with torch.inference_mode():
+            distance = model.pairwise_from_latents(first, second)
+            reverse = model.pairwise_from_latents(second, first)
+            identity = model.pairwise_from_latents(first, first)
+
+        self.assertTrue(torch.all(distance >= 0))
+        torch.testing.assert_close(
+            identity, torch.zeros_like(identity), rtol=0, atol=0
+        )
+        torch.testing.assert_close(distance, reverse, rtol=0, atol=0)
+
+    def test_joint_checkpoint_metadata_loads(self) -> None:
+        kwargs = {
+            "input_dim": 4,
+            "latent_dim": 5,
+            "phi_hidden_dim": 7,
+            "f_hidden_dim": 9,
+        }
+        expected = MAPFN(**kwargs).eval()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "joint.pt"
+            torch.save(
+                {
+                    "format_version": 2,
+                    "architecture": "joint",
+                    "model_name": "ma_pfn",
+                    "model_kwargs": kwargs,
+                    "model_state_dict": expected.state_dict(),
+                },
+                path,
+            )
+            loaded = load_checkpoint(path, torch.device("cpu"))
+
+        self.assertIsInstance(loaded, MAPFN)
+        for expected_parameter, loaded_parameter in zip(
+            expected.parameters(), loaded.parameters()
+        ):
+            torch.testing.assert_close(expected_parameter, loaded_parameter)
+
+    def test_legacy_factorized_checkpoint_is_not_silently_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "factorized.pt"
+            torch.save(
+                {
+                    "format_version": 1,
+                    "architecture": "ma_pfn",
+                    "model_kwargs": {},
+                    "model_state_dict": {},
+                },
+                path,
+            )
+            with self.assertRaisesRegex(ValueError, "legacy factorized"):
+                load_checkpoint(path, torch.device("cpu"))
 
     def test_explicit_cache_matches_ordinary_pair_encoding(self) -> None:
         events = reconstruct_split_events(self.data_dir)

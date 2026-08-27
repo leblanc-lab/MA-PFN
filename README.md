@@ -7,6 +7,15 @@ same data split and optimizer settings, then compares their held-out accuracy
 and metric properties. Both models use the constructed dimensionless objective
 `MAPE + 0.25 * MAE / 90 GeV`, matching the production hybrid-loss controls.
 
+This example implements the selected symmetric joint-head MA-PFN. Its shared
+encoder maps `4 -> 100 -> 100 -> 64`. A `128 -> 100 -> 100 -> 100 -> 1` head
+receives the pooled latent sum and signed difference, is evaluated at both
+event orientations, and has its two outputs averaged. The prediction is the
+mean absolute latent separation multiplied by the softplus of that symmetric
+head output. This gives non-negativity, zero self-distance, and exchange
+symmetry by construction. At these dimensions, MA-PFN has **50,265** trainable
+parameters and the matched stock PFN has **43,865**.
+
 ## Contents
 
 - `ma_pfn_demo.py`: readable Jupytext source for the notebook.
@@ -17,7 +26,8 @@ and metric properties. Both models use the constructed dimensionless objective
 - `models.py`: side-by-side MA-PFN and stock-PFN model definitions.
 - `utils.py`: subset extraction, data loading, training, evaluation, plotting,
   and CLI helpers.
-- `test_demo.py`: fast checks for the data, loss, and cached model path.
+- `test_demo.py`: fast checks for data, loss, parameter counts, structural
+  properties, and the cached model path.
 - `make_notebook.py`: local Jupytext wrapper used by CI.
 - `jupytext.toml`: declares the paired `ipynb,py:percent` formats.
 - `.github/workflows/sync-notebook.yml`: regenerates and commits the notebook
@@ -33,21 +43,6 @@ No data download is required to run the notebook tutorial. On **Run All**, the
 notebook uses the six arrays in `data/` when they are present. When none is
 present, it extracts the bundled `ma_pfn_tutorial.npz` into
 `results_notebook/tutorial_data/` after verifying its SHA-256 checksum.
-
-The compact archive is not synthetic. It selects 448 training, 64 validation,
-and 64 test source events from the full released event-disjoint splits using
-seed 12,345. It retains all unordered pairs among the selected events—100,128,
-2,016, and 2,016 pairs respectively—and copies their exact EMD targets without
-recomputation. Particle features are converted from float64 to float32 only to
-reduce the compressed archive size. The notebook selects exactly 100,000 of
-the available training pairs reproducibly. The selected source-event
-indices, source-array checksums, pair-row hashes, shapes, and target ranges are
-embedded in the archive metadata.
-
-The same archive is included in the Zenodo upload manifest. The loader has a
-checksum-pinned Zenodo file URL as a fallback for distributions that omit the
-bundled copy; that URL becomes public when the currently configured record
-`22099234` is published.
 
 To use the released sample, place its six NumPy arrays in `data/` (or pass
 another directory with `--data-dir` to the command-line workflow):
@@ -126,9 +121,9 @@ python run_demo.py \
   --metric-samples 1000
 ```
 
-For the release-scale configuration, omit the training and validation pair
-limits and use the defaults of 500 epochs, patience 50, batch size 1,024, Adam
-learning rate `1e-4`, and seed 12,345:
+For the production training configuration, omit the training and validation
+pair limits. The defaults are 700 epochs, patience 50, batch size 1,024, AdamW
+with learning rate `1e-4` and zero weight decay, and seed 23,411:
 
 ```bash
 python run_demo.py \
@@ -142,7 +137,15 @@ The two models train sequentially, making the command work on a one-GPU
 machine. Progress is printed once per epoch. The validation set controls early
 stopping using the hybrid objective; the test set is first touched by the final
 benchmark. The objective, MAPE, and MAE in GeV are all logged separately. The
-loss can be varied explicitly with `--loss`, `--mae-weight`, and `--mae-scale`.
+loss can be varied explicitly with `--loss`, `--mae-weight`, and `--mae-scale`;
+optimizer weight decay can be varied with `--weight-decay`.
+
+The command-line defaults of 100,000 held-out pairs and 20,000 metric samples
+are deliberately smaller evaluation workloads for this minimal example. They
+must not be reported as reproducing the paper's all-798,216-pair response study
+or its one-million-triplet metric-property study. To request those paper-scale
+sample counts from checkpoints trained by this workflow, pass
+`--max-test-pairs 0 --metric-samples 1000000`.
 
 Training and benchmarking can be separated without retraining:
 
@@ -151,8 +154,9 @@ python run_demo.py --stage train --data-dir data --output-dir results --device c
 python run_demo.py --stage benchmark --data-dir data --output-dir results --device cuda
 ```
 
-Architecture dimensions are stored in each checkpoint, so a benchmark-only
-command reconstructs the trained models without repeating those arguments.
+Architecture dimensions and the explicit `joint` or `baseline` architecture
+identifier are stored in each checkpoint, so a benchmark-only command
+reconstructs the trained models without repeating those arguments.
 
 Held-out inference defaults to the cached-latent path used by the timing
 benchmarks. Each unique test event is transferred and encoded before pair

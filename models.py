@@ -87,7 +87,17 @@ class ParticleLevelLinear(nn.Module):
 
 
 class MAPFN(nn.Module):
-    """Metric-aware PFN with three exact structural metric properties."""
+    """Exchange-symmetrized joint-head MA-PFN used by the release model.
+
+    The shared particle encoder produces one latent vector per event.  A joint
+    head sees the latent sum and signed difference in both event orientations.
+    Averaging those two evaluations makes exchange symmetry exact without
+    discarding sign information.  The mean absolute latent separation gives
+    exact zero self-distance, and softplus makes predictions non-negative.
+
+    Triangle inequality is evaluated empirically rather than enforced by this
+    architecture.
+    """
 
     def __init__(
         self, input_dim: int, latent_dim: int, phi_hidden_dim: int, f_hidden_dim: int
@@ -97,16 +107,10 @@ class MAPFN(nn.Module):
         self.phi_fc2 = ParticleLevelLinear(phi_hidden_dim, phi_hidden_dim)
         self.phi_fc3 = ParticleLevelLinear(phi_hidden_dim, latent_dim)
 
-        # No biases: zero latent difference must map to zero.
-        self.f_diff1 = nn.Linear(latent_dim, f_hidden_dim, bias=False)
-        self.f_diff2 = nn.Linear(f_hidden_dim, f_hidden_dim, bias=False)
-        self.f_diff3 = nn.Linear(f_hidden_dim, f_hidden_dim, bias=False)
-        self.f_diff4 = nn.Linear(f_hidden_dim, 1, bias=False)
-
-        self.f_sum1 = nn.Linear(latent_dim, f_hidden_dim)
-        self.f_sum2 = nn.Linear(f_hidden_dim, f_hidden_dim)
-        self.f_sum3 = nn.Linear(f_hidden_dim, f_hidden_dim)
-        self.f_sum4 = nn.Linear(f_hidden_dim, 1)
+        self.f_joint1 = nn.Linear(2 * latent_dim, f_hidden_dim)
+        self.f_joint2 = nn.Linear(f_hidden_dim, f_hidden_dim)
+        self.f_joint3 = nn.Linear(f_hidden_dim, f_hidden_dim)
+        self.f_joint4 = nn.Linear(f_hidden_dim, 1)
 
     def _particle_features(self, inputs: torch.Tensor) -> torch.Tensor:
         """Encode particles without learning the event-identity tag."""
@@ -142,23 +146,29 @@ class MAPFN(nn.Module):
     ) -> torch.Tensor:
         """Score aligned pairs of cached event latents."""
 
-        difference = torch.abs(first - second)
-        total = first + second
-
-        difference = F.relu(self.f_diff1(difference))
-        difference = F.relu(self.f_diff2(difference))
-        difference = F.relu(self.f_diff3(difference))
-        difference = self.f_diff4(difference)
-
-        total = F.relu(self.f_sum1(total))
-        total = F.relu(self.f_sum2(total))
-        total = F.relu(self.f_sum3(total))
-        total = self.f_sum4(total)
-        prediction = torch.abs(difference * total)[:, 0]
-
-        # This also removes tiny floating-point remnants for identical latents.
-        identical = torch.isclose(first, second, rtol=1e-5, atol=1e-6).all(dim=1)
+        latent_sum = first + second
+        latent_difference = first - second
+        identical = torch.isclose(
+            first, second, rtol=1e-5, atol=1e-6
+        ).all(dim=1)
+        symmetric_log_scale = 0.5 * (
+            self.joint_head(latent_sum, latent_difference)
+            + self.joint_head(latent_sum, -latent_difference)
+        )
+        latent_separation = torch.mean(torch.abs(latent_difference), dim=1)
+        prediction = latent_separation * F.softplus(symmetric_log_scale)
         return torch.where(identical, torch.zeros_like(prediction), prediction)
+
+    def joint_head(
+        self, latent_sum: torch.Tensor, latent_difference: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the learned log scale for one signed event orientation."""
+
+        features = torch.cat((latent_sum, latent_difference), dim=1)
+        features = F.relu(self.f_joint1(features))
+        features = F.relu(self.f_joint2(features))
+        features = F.relu(self.f_joint3(features))
+        return self.f_joint4(features)[:, 0]
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.pairwise_from_latents(*self.event_latents(inputs))

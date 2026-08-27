@@ -24,6 +24,7 @@ from models import HybridEMDLoss, MAPFN, PFN
 
 MODEL_LABELS = {"ma_pfn": "MA-PFN", "pfn": "PFN"}
 MODEL_COLORS = {"ma_pfn": "#0072B2", "pfn": "#D55E00"}
+MODEL_ARCHITECTURES = {"ma_pfn": "joint", "pfn": "baseline"}
 DATA_SPLITS = ("train", "val", "test")
 TUTORIAL_SUBSET_FILENAME = "ma_pfn_tutorial.npz"
 TUTORIAL_SUBSET_SHA256 = (
@@ -42,15 +43,16 @@ class WorkflowConfig:
     data_dir: Path = Path("data")
     output_dir: Path = Path("results")
     stage: str = "all"
-    epochs: int = 500
+    epochs: int = 700
     patience: int = 50
     batch_size: int = 1024
     learning_rate: float = 1e-4
+    weight_decay: float = 0.0
     loss: str = "hybrid"
     mae_weight: float = 0.25
     mae_scale: float = 90.0
     num_workers: int = 0
-    seed: int = 12345
+    seed: int = 23411
     latent_dim: int = 64
     phi_hidden_dim: int = 100
     f_hidden_dim: int = 100
@@ -69,6 +71,8 @@ class WorkflowConfig:
 def make_model(name: str, config: WorkflowConfig) -> nn.Module:
     """Build either model with the shared architecture settings."""
 
+    if name not in MODEL_LABELS:
+        raise ValueError(f"Unknown model name: {name}")
     model_class: type[nn.Module] = MAPFN if name == "ma_pfn" else PFN
     return model_class(
         input_dim=4,
@@ -184,7 +188,11 @@ def train_one_model(
 ) -> tuple[nn.Module, dict]:
     set_seed(config.seed)
     model = make_model(name, config).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
     loss_fn = HybridEMDLoss(
         mae_weight=config.mae_weight,
         mae_scale=config.mae_scale,
@@ -212,6 +220,7 @@ def train_one_model(
         flush=True,
     )
     print(f"  objective: {loss_fn.description}", flush=True)
+    print(f"  AdamW weight decay: {config.weight_decay:g}", flush=True)
 
     history: dict[str, object] = {
         "train_objective": [],
@@ -252,8 +261,9 @@ def train_one_model(
             best_epoch = epoch
             best_metrics = val_metrics.copy()
             checkpoint = {
-                "format_version": 1,
-                "architecture": name,
+                "format_version": 2,
+                "architecture": MODEL_ARCHITECTURES[name],
+                "model_name": name,
                 "loss": {
                     "name": config.loss,
                     "mae_weight": config.mae_weight,
@@ -265,6 +275,14 @@ def train_one_model(
                     "latent_dim": config.latent_dim,
                     "phi_hidden_dim": config.phi_hidden_dim,
                     "f_hidden_dim": config.f_hidden_dim,
+                },
+                "training": {
+                    "seed": config.seed,
+                    "epoch": epoch + 1,
+                    "optimizer": "AdamW",
+                    "learning_rate": config.learning_rate,
+                    "weight_decay": config.weight_decay,
+                    "batch_size": config.batch_size,
                 },
                 "model_state_dict": model.state_dict(),
             }
@@ -293,6 +311,10 @@ def train_one_model(
             "objective_description": loss_fn.description,
             "mae_weight": config.mae_weight,
             "mae_scale_gev": config.mae_scale,
+            "optimizer": "AdamW",
+            "learning_rate": config.learning_rate,
+            "weight_decay": config.weight_decay,
+            "seed": config.seed,
             "epochs_completed": len(history["train_objective"]),
             "best_epoch": best_epoch + 1,
             "best_val_objective": best_metrics["objective"],
@@ -311,8 +333,18 @@ def load_checkpoint(path: Path, device: torch.device) -> nn.Module:
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:  # PyTorch before weights_only was added.
         checkpoint = torch.load(path, map_location="cpu")
-    name = checkpoint["architecture"]
-    model_class: type[nn.Module] = MAPFN if name == "ma_pfn" else PFN
+    architecture = checkpoint["architecture"]
+    if architecture == "joint":
+        model_class: type[nn.Module] = MAPFN
+    elif architecture in {"baseline", "pfn"}:
+        model_class = PFN
+    elif architecture == "ma_pfn":
+        raise ValueError(
+            "This is a legacy factorized MA-PFN checkpoint and is incompatible "
+            "with the selected symmetric joint architecture"
+        )
+    else:
+        raise ValueError(f"Unsupported checkpoint architecture: {architecture}")
     model = model_class(**checkpoint["model_kwargs"])
     model.load_state_dict(checkpoint["model_state_dict"])
     return model.to(device).eval()
@@ -1246,6 +1278,8 @@ def validate_config(config: WorkflowConfig) -> None:
         raise ValueError("loss must be mape, mae, or hybrid")
     if config.mae_weight < 0 or config.mae_scale <= 0:
         raise ValueError("mae_weight must be non-negative and mae_scale positive")
+    if config.weight_decay < 0:
+        raise ValueError("weight_decay must be non-negative")
     if config.metric_samples <= 0 or config.tolerance < 0:
         raise ValueError("metric_samples must be positive and tolerance non-negative")
     if config.cpu_threads is not None and config.cpu_threads <= 0:
@@ -1330,12 +1364,13 @@ def parse_args() -> WorkflowConfig:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
     parser.add_argument("--stage", choices=("all", "train", "benchmark"), default="all")
-    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--epochs", type=int, default=700)
     parser.add_argument(
         "--patience", type=int, default=50, help="0 disables early stopping"
     )
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument(
         "--loss", choices=("mape", "mae", "hybrid"), default="hybrid"
     )
@@ -1347,7 +1382,7 @@ def parse_args() -> WorkflowConfig:
         help="GeV scale that makes the hybrid loss's MAE term dimensionless",
     )
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--seed", type=int, default=23411)
     parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--phi-hidden-dim", type=int, default=100)
     parser.add_argument("--f-hidden-dim", type=int, default=100)
