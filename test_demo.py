@@ -1,0 +1,218 @@
+"""Fast regression tests for the runnable MA-PFN tutorial."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+import numpy as np
+import torch
+
+from models import HybridEMDLoss, MAPFN, PFN
+from utils import (
+    TUTORIAL_SUBSET_FILENAME,
+    WorkflowConfig,
+    load_checkpoint,
+    predict_event_pairs,
+    prepare_demo_data,
+    reconstruct_split_events,
+)
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+class TutorialDataTests(unittest.TestCase):
+    def test_bundled_archive_filename(self) -> None:
+        self.assertEqual(TUTORIAL_SUBSET_FILENAME, "ma_pfn_tutorial.npz")
+
+    def test_bundled_archive_metadata(self) -> None:
+        archive_path = ROOT / "ma_pfn_tutorial.npz"
+        with np.load(archive_path, allow_pickle=False) as archive:
+            metadata = json.loads(str(archive["metadata_json"]))
+        self.assertEqual(metadata["format"], "ma-pfn-real-tutorial-subset")
+        self.assertEqual(metadata["version"], 4)
+        self.assertEqual(
+            set(metadata),
+            {"format", "version", "selection_seed", "selection", "storage", "splits"},
+        )
+        self.assertEqual(
+            {
+                split: details["selected_event_count"]
+                for split, details in metadata["splits"].items()
+            },
+            {"train": 448, "val": 64, "test": 64},
+        )
+
+    def test_missing_release_data_extracts_and_reuses_real_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = prepare_demo_data(root / "release", root / "subset")
+            second = prepare_demo_data(root / "release", root / "subset")
+
+            self.assertEqual(first["kind"], "real_tutorial_subset")
+            self.assertTrue(first["extracted"])
+            self.assertFalse(second["extracted"])
+            self.assertEqual(first["archive_source"], "bundled")
+            self.assertEqual(second["archive_source"], "extracted_cache")
+            self.assertEqual(
+                reconstruct_split_events(root / "subset").shape, (64, 76, 3)
+            )
+
+    def test_partial_release_data_has_an_actionable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = root / "release"
+            release.mkdir()
+            np.save(release / "train_targets.npy", np.ones(1, dtype=np.float32))
+            with self.assertRaisesRegex(FileNotFoundError, "incomplete; missing"):
+                prepare_demo_data(release, root / "subset")
+
+
+class ModelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.temporary = tempfile.TemporaryDirectory()
+        root = Path(cls.temporary.name)
+        cls.data_dir = root / "subset"
+        prepare_demo_data(
+            root / "release",
+            cls.data_dir,
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.temporary.cleanup()
+
+    def test_hybrid_loss_components(self) -> None:
+        config = WorkflowConfig()
+        self.assertEqual(config.loss, "hybrid")
+        self.assertEqual(config.mae_weight, 0.25)
+        self.assertEqual(config.mae_scale, 90.0)
+        self.assertEqual(config.epochs, 700)
+        self.assertEqual(config.patience, 50)
+        self.assertEqual(config.batch_size, 1024)
+        self.assertEqual(config.learning_rate, 1e-4)
+        self.assertEqual(config.weight_decay, 0.0)
+        self.assertEqual(config.seed, 23411)
+
+        prediction = torch.tensor([8.0, 24.0])
+        target = torch.tensor([10.0, 20.0])
+        objective, mape, mae = HybridEMDLoss(
+            mae_weight=config.mae_weight,
+            mae_scale=config.mae_scale,
+        ).components(prediction, target)
+        torch.testing.assert_close(mape, torch.tensor(0.2))
+        torch.testing.assert_close(mae, torch.tensor(3.0))
+        torch.testing.assert_close(objective, torch.tensor(0.20833333))
+
+    def test_release_parameter_counts(self) -> None:
+        kwargs = {
+            "input_dim": 4,
+            "latent_dim": 64,
+            "phi_hidden_dim": 100,
+            "f_hidden_dim": 100,
+        }
+        ma_pfn_parameters = sum(
+            parameter.numel() for parameter in MAPFN(**kwargs).parameters()
+        )
+        pfn_parameters = sum(
+            parameter.numel() for parameter in PFN(**kwargs).parameters()
+        )
+        self.assertEqual(ma_pfn_parameters, 50_265)
+        self.assertEqual(pfn_parameters, 43_865)
+
+    def test_ma_pfn_structural_properties(self) -> None:
+        torch.manual_seed(23411)
+        model = MAPFN(4, 5, 7, 9).eval()
+        first = torch.randn(16, 5)
+        second = torch.randn(16, 5)
+
+        with torch.inference_mode():
+            distance = model.pairwise_from_latents(first, second)
+            reverse = model.pairwise_from_latents(second, first)
+            identity = model.pairwise_from_latents(first, first)
+
+        self.assertTrue(torch.all(distance >= 0))
+        torch.testing.assert_close(
+            identity, torch.zeros_like(identity), rtol=0, atol=0
+        )
+        torch.testing.assert_close(distance, reverse, rtol=0, atol=0)
+
+    def test_joint_checkpoint_metadata_loads(self) -> None:
+        kwargs = {
+            "input_dim": 4,
+            "latent_dim": 5,
+            "phi_hidden_dim": 7,
+            "f_hidden_dim": 9,
+        }
+        expected = MAPFN(**kwargs).eval()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "joint.pt"
+            torch.save(
+                {
+                    "format_version": 2,
+                    "architecture": "joint",
+                    "model_name": "ma_pfn",
+                    "model_kwargs": kwargs,
+                    "model_state_dict": expected.state_dict(),
+                },
+                path,
+            )
+            loaded = load_checkpoint(path, torch.device("cpu"))
+
+        self.assertIsInstance(loaded, MAPFN)
+        for expected_parameter, loaded_parameter in zip(
+            expected.parameters(), loaded.parameters()
+        ):
+            torch.testing.assert_close(expected_parameter, loaded_parameter)
+
+    def test_legacy_factorized_checkpoint_is_not_silently_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "factorized.pt"
+            torch.save(
+                {
+                    "format_version": 1,
+                    "architecture": "ma_pfn",
+                    "model_kwargs": {},
+                    "model_state_dict": {},
+                },
+                path,
+            )
+            with self.assertRaisesRegex(ValueError, "legacy factorized"):
+                load_checkpoint(path, torch.device("cpu"))
+
+    def test_explicit_cache_matches_ordinary_pair_encoding(self) -> None:
+        events = reconstruct_split_events(self.data_dir)
+        event_tensor = torch.from_numpy(events)
+        first_numpy = np.array([0, 0, 2, 4], dtype=np.int64)
+        second_numpy = np.array([1, 3, 5, 6], dtype=np.int64)
+        first = torch.from_numpy(first_numpy)
+        second = torch.from_numpy(second_numpy)
+
+        for model in (MAPFN(4, 5, 7, 9), PFN(4, 5, 7, 9)):
+            model.eval()
+            with torch.inference_mode():
+                if isinstance(model, MAPFN):
+                    first_latents = second_latents = model.encode_events(event_tensor)
+                else:
+                    first_latents = model.encode_events(event_tensor, event_id=-1.0)
+                    second_latents = model.encode_events(event_tensor, event_id=1.0)
+                cached = model.pairwise_from_latents(
+                    first_latents[first], second_latents[second]
+                ).numpy()
+            ordinary = predict_event_pairs(
+                model,
+                events,
+                first_numpy,
+                second_numpy,
+                batch_size=4,
+                device=torch.device("cpu"),
+            )
+            np.testing.assert_allclose(cached, ordinary, rtol=2e-5, atol=2e-5)
+
+
+if __name__ == "__main__":
+    unittest.main()

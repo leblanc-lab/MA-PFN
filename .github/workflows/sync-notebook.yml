@@ -1,0 +1,52 @@
+name: Sync generated notebook
+
+on:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "ma_pfn_demo.py"
+      - "models.py"
+      - "utils.py"
+      - "make_notebook.py"
+      - "jupytext.toml"
+      - ".github/workflows/sync-notebook.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-notebook-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync-notebook:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pushed branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Jupytext
+        run: python -m pip install jupytext==1.19.5
+
+      - name: Generate notebook from Python source
+        run: python make_notebook.py
+
+      - name: Commit the generated notebook when changed
+        run: |
+          if git diff --quiet -- ma_pfn_demo.ipynb; then
+            echo "Notebook is already current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ma_pfn_demo.ipynb
+          git commit -m "chore: sync generated notebook"
+          git push
